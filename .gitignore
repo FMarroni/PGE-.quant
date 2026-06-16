@@ -1,0 +1,16 @@
+# Credenciais — nunca versionar (configurar via Secrets do Streamlit Cloud)
+.streamlit/secrets.toml
+
+# Banco local / dados brutos
+*.db
+Base de dados/
+
+# Ambiente Python portátil (recriado pelo instalar_e_abrir.bat)
+python_local/
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Pacotes zipados de distribuição
+*.zip
