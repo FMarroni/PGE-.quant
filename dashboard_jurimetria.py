@@ -1159,7 +1159,48 @@ def _sidebar(df_full: pd.DataFrame) -> pd.DataFrame:
     if assunto_sel:
         mask &= df_full["assunto_label"].isin(assunto_sel)
 
-    return df_full[mask].copy()
+    return df_full[mask].copy(), {
+        "nucleo":     nucleo_sel,
+        "procurador": procurador_sel,
+        "periodo":    periodo,
+    }
+
+
+def _filtrar_demandas_frente2(df_dem_full: pd.DataFrame, filtros: dict) -> pd.DataFrame:
+    """Filtra df_dem_full diretamente pelas seleções da sidebar, usando as
+    datas nativas da própria demanda (conclusao / entrada) — independente dos
+    processos resultantes da Frente 1."""
+    if df_dem_full.empty:
+        return df_dem_full.copy()
+
+    mask = pd.Series(True, index=df_dem_full.index)
+
+    nucleo_sel     = filtros.get("nucleo", [])
+    procurador_sel = filtros.get("procurador", [])
+    periodo        = filtros.get("periodo")
+
+    if nucleo_sel:
+        mask &= df_dem_full["nucleo"].isin(nucleo_sel)
+
+    if procurador_sel:
+        mask &= df_dem_full["procurador"].isin(procurador_sel)
+
+    if isinstance(periodo, (list, tuple)) and len(periodo) == 2:
+        d_ini, d_fim = periodo
+        data_ref = df_dem_full["conclusao"].fillna(df_dem_full["entrada"])
+        ts_fim   = pd.Timestamp(d_fim) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        mask &= data_ref.isna() | data_ref.between(pd.Timestamp(d_ini), ts_fim)
+    elif isinstance(periodo, date):
+        data_ref = df_dem_full["conclusao"].fillna(df_dem_full["entrada"])
+        mask &= (
+            data_ref.isna()
+            | (
+                (data_ref >= pd.Timestamp(periodo))
+                & (data_ref < pd.Timestamp(periodo) + pd.Timedelta(days=1))
+            )
+        )
+
+    return df_dem_full[mask].copy()
 
 # =============================================================================
 # GRÁFICOS — TAB 1  (Panorama Geral)
@@ -2834,13 +2875,17 @@ def main() -> None:
         return
 
     df_full = _carregar_df()
-    df      = _sidebar(df_full)
+    df_proc_filtered, filtros_sidebar = _sidebar(df_full)
+    df = df_proc_filtered  # Frente 1: filtrado por acervo e titularidade do processo
 
     df_dem_full = _carregar_demandas()
-    if not df_dem_full.empty and "processo_base" in df_dem_full.columns:
-        df_dem = df_dem_full[df_dem_full["processo_base"].isin(df["processo"])].copy()
-    else:
-        df_dem = pd.DataFrame()
+    # Frente 2: filtrado diretamente pelas seleções da sidebar sobre as demandas,
+    # sem qualquer dependência dos processos resultantes da Frente 1.
+    df_dem_filtered = (
+        _filtrar_demandas_frente2(df_dem_full, filtros_sidebar)
+        if not df_dem_full.empty
+        else pd.DataFrame()
+    )
 
     # ── Barra superior ──────────────────────────────────────────────────────
     nucleos_ativos = st.session_state.get("f_nucleo", [])
@@ -2910,15 +2955,15 @@ def main() -> None:
             "Histórico e Linha do Tempo",
         ])
         with o1:
-            _subtab_f2_nucleos(df, df_dem)
+            _subtab_f2_nucleos(df, df_dem_filtered)
         with o2:
-            _subtab_f2_fluxo(df_dem)
+            _subtab_f2_fluxo(df_dem_filtered)
         with o3:
-            _subtab_f2_sazonalidade(df_dem)
+            _subtab_f2_sazonalidade(df_dem_filtered)
         with o4:
-            _subtab_f2_gargalos(df_dem)
+            _subtab_f2_gargalos(df_dem_filtered)
         with o5:
-            _subtab_f2_procuradores(df_dem)
+            _subtab_f2_procuradores(df_dem_filtered)
         with o6:
             _subtab_f2_timeline(df, df_dem_full)
 
