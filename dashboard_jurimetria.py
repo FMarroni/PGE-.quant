@@ -2848,6 +2848,608 @@ def _tab_upload() -> None:
         st.metric("Demandas (total)", f"{resumo_total['demandas']:,}".replace(",", "."))
 
 # =============================================================================
+# GERAÇÃO DE RELATÓRIOS WORD
+# =============================================================================
+
+def _substituir_placeholders(doc, mapa: dict) -> None:
+    """Substitui {{PLACEHOLDER}} em todos os parágrafos e tabelas do documento."""
+    def _proc_para(para):
+        for run in para.runs:
+            for chave, valor in mapa.items():
+                if chave in run.text:
+                    run.text = run.text.replace(chave, str(valor))
+
+    for para in doc.paragraphs:
+        _proc_para(para)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _proc_para(para)
+                for nested in cell.tables:
+                    for nrow in nested.rows:
+                        for ncell in nrow.cells:
+                            for npara in ncell.paragraphs:
+                                _proc_para(npara)
+
+
+def _gerar_relatorio(template_path: Path, mapa: dict) -> bytes | None:
+    """Abre o template .docx, substitui os placeholders e retorna bytes."""
+    try:
+        from docx import Document  # type: ignore[import]
+    except ImportError:
+        st.error("Pacote 'python-docx' não instalado. Execute: pip install python-docx", icon="❌")
+        return None
+    if not template_path.exists():
+        st.warning(f"Template não encontrado: {template_path.name}", icon="⚠️")
+        return None
+    try:
+        import io as _io
+        doc = Document(str(template_path))
+        _substituir_placeholders(doc, mapa)
+        buf = _io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as exc:
+        st.error(f"Erro ao gerar relatório: {exc}", icon="❌")
+        return None
+
+
+def _build_mapa_frente1(df: pd.DataFrame, filtros_sidebar: dict) -> dict:
+    """Monta o dicionário de substituição para o relatório da Frente 1."""
+    hoje = date.today().strftime("%d/%m/%Y")
+
+    # ── Metadados ─────────────────────────────────────────────────────────────
+    nucleo_label = ", ".join(filtros_sidebar.get("nucleo", [])) or "Todos os núcleos"
+    periodo_label = "—"
+    if not df.empty and "ajuizamento" in df.columns:
+        datas = df["ajuizamento"].dropna()
+        if not datas.empty:
+            periodo_label = (
+                f"{datas.min().strftime('%m/%Y')} a {datas.max().strftime('%m/%Y')}"
+            )
+    filtros_txt_parts = []
+    if filtros_sidebar.get("nucleo"):
+        filtros_txt_parts.append(f"Núcleo: {nucleo_label}")
+    if filtros_sidebar.get("procurador"):
+        filtros_txt_parts.append(
+            "Procurador: " + ", ".join(filtros_sidebar["procurador"])
+        )
+    filtros_label = "; ".join(filtros_txt_parts) or "Sem filtros adicionais"
+
+    # ── KPIs ──────────────────────────────────────────────────────────────────
+    kpi = _kpis(df) if not df.empty else {
+        "total": 0, "em_risco": 0.0, "economia": 0.0,
+        "taxa": 0.0, "vitorias": 0, "perdas": 0, "decididos": 0,
+    }
+    valor_medio = (df["valor"].mean() if not df.empty else 0.0)
+    n_comarcas  = (df["comarca_limpa"].nunique() if not df.empty and "comarca_limpa" in df.columns else 0)
+    n_andamento = int((df["status_exito"] == "Em Andamento").sum()) if not df.empty else 0
+
+    # ── Teses (top 5 por volume) ───────────────────────────────────────────────
+    if not df.empty and "assunto_label" in df.columns:
+        teses_df = (
+            df.groupby("assunto_label")
+            .agg(
+                total    = ("processo",      "count"),
+                vitorias = ("status_exito",  lambda x: (x == "Vitória").sum()),
+                perdas   = ("status_exito",  lambda x: (x == "Perda").sum()),
+                valor    = ("valor",         "sum"),
+            )
+            .assign(
+                em_andamento = lambda d: d["total"] - d["vitorias"] - d["perdas"],
+                taxa         = lambda d: (
+                    (d["vitorias"] / (d["vitorias"] + d["perdas"]) * 100)
+                    .where((d["vitorias"] + d["perdas"]) > 0)
+                    .fillna(0).round(1)
+                ),
+            )
+            .sort_values("total", ascending=False)
+            .head(5)
+            .reset_index()
+        )
+    else:
+        teses_df = pd.DataFrame()
+
+    def _t(i, col, fmt=None):
+        if i < len(teses_df):
+            val = teses_df.iloc[i][col]
+            return _brl(val) if fmt == "brl" else (f"{val:.1f}%" if fmt == "pct" else str(val))
+        return "—"
+
+    # ── Êxitos por tese (reutiliza teses_df) ──────────────────────────────────
+    def _e(i, col, fmt=None):
+        return _t(i, col, fmt)
+
+    # ── Comarcas (top 10) ─────────────────────────────────────────────────────
+    if not df.empty and "comarca_limpa" in df.columns:
+        com_df = (
+            df.groupby("comarca_limpa")
+            .agg(
+                total    = ("processo",     "count"),
+                vitorias = ("status_exito", lambda x: (x == "Vitória").sum()),
+                perdas   = ("status_exito", lambda x: (x == "Perda").sum()),
+                valor    = ("valor",        "sum"),
+            )
+            .assign(
+                taxa = lambda d: (
+                    (d["vitorias"] / (d["vitorias"] + d["perdas"]) * 100)
+                    .where((d["vitorias"] + d["perdas"]) > 0)
+                    .fillna(0).round(1)
+                )
+            )
+            .sort_values("total", ascending=False)
+            .head(10)
+            .reset_index()
+        )
+    else:
+        com_df = pd.DataFrame()
+
+    def _c(i, col, fmt=None):
+        if i < len(com_df):
+            val = com_df.iloc[i][col]
+            return _brl(val) if fmt == "brl" else (f"{val:.1f}%" if fmt == "pct" else str(val))
+        return "—"
+
+    # ── Linha do tempo (últimos 6 meses por ajuizamento) ──────────────────────
+    if not df.empty and "ajuizamento" in df.columns:
+        tmp = df.copy()
+        tmp["mes"] = tmp["ajuizamento"].dt.to_period("M")
+        tempo_df = (
+            tmp.groupby("mes")
+            .agg(
+                novos    = ("processo",     "count"),
+                decididos= ("status_exito", lambda x: ((x=="Vitória")|(x=="Perda")).sum()),
+                vitorias = ("status_exito", lambda x: (x=="Vitória").sum()),
+                perdas   = ("status_exito", lambda x: (x=="Perda").sum()),
+                andamento= ("status_exito", lambda x: (x=="Em Andamento").sum()),
+                valor    = ("valor",        "sum"),
+            )
+            .tail(6)
+            .reset_index()
+        )
+        tempo_df["mes_str"] = tempo_df["mes"].astype(str)
+    else:
+        tempo_df = pd.DataFrame()
+
+    def _tmp(i, col, fmt=None):
+        if i < len(tempo_df):
+            val = tempo_df.iloc[i][col]
+            return _brl(val) if fmt == "brl" else str(val)
+        return "—"
+
+    # ── Detalhamento (top 10 por valor) ───────────────────────────────────────
+    if not df.empty:
+        det_df = df.nlargest(10, "valor").reset_index(drop=True)
+    else:
+        det_df = pd.DataFrame()
+
+    def _d(i, col, fmt=None):
+        if i < len(det_df):
+            val = det_df.iloc[i].get(col, "—")
+            if pd.isna(val):
+                return "—"
+            return _brl(float(val)) if fmt == "brl" else str(val)
+        return "—"
+
+    def _d_date(i, col):
+        if i < len(det_df):
+            val = det_df.iloc[i].get(col)
+            if pd.isna(val) if val is not None else True:
+                return "—"
+            try:
+                return pd.Timestamp(val).strftime("%d/%m/%Y")
+            except Exception:
+                return str(val)
+        return "—"
+
+    # ── Mapa final ────────────────────────────────────────────────────────────
+    mapa: dict = {
+        "{{DATA_GERACAO}}":     hoje,
+        "{{NUCLEO}}":           nucleo_label,
+        "{{PERIODO}}":          periodo_label,
+        "{{FILTROS_APLICADOS}}": filtros_label,
+
+        # KPIs
+        "{{TOTAL_PROCESSOS}}":  f"{kpi['total']:,}".replace(",", "."),
+        "{{QTD_EM_ANDAMENTO}}": f"{n_andamento:,}".replace(",", "."),
+        "{{VALOR_EM_RISCO}}":   _brl(kpi["em_risco"]),
+        "{{VALOR_ECONOMIA}}":   _brl(kpi["economia"]),
+        "{{QTD_VITORIAS}}":     str(kpi["vitorias"]),
+        "{{QTD_PERDAS}}":       str(kpi["perdas"]),
+        "{{QTD_DECIDIDOS}}":    str(kpi["decididos"]),
+        "{{TAXA_EXITO}}":       f"{kpi['taxa']:.1f}%",
+        "{{VALOR_MEDIO}}":      _brl(valor_medio),
+        "{{QTD_COMARCAS}}":     str(n_comarcas),
+    }
+
+    # Teses 1–5
+    for i in range(5):
+        n = i + 1
+        mapa[f"{{{{TESE_{n}}}}}"]  = _t(i, "assunto_label")
+        mapa[f"{{{{N{n}}}}}"]       = _t(i, "total")
+        mapa[f"{{{{V{n}}}}}"]       = _t(i, "vitorias")
+        mapa[f"{{{{P{n}}}}}"]       = _t(i, "perdas")
+        mapa[f"{{{{A{n}}}}}"]       = _t(i, "em_andamento")
+        mapa[f"{{{{T{n}}}}}"]       = _t(i, "taxa", "pct")
+        mapa[f"{{{{VAL{n}}}}}"]     = _t(i, "valor", "brl")
+        # Êxitos (mesma fonte)
+        mapa[f"{{{{E{n}_N}}}}"]     = _t(i, "assunto_label")
+        mapa[f"{{{{E{n}_P}}}}"]     = _t(i, "taxa", "pct")
+        mapa[f"{{{{E{n}_VAL}}}}"]   = _t(i, "valor", "brl")
+        mapa[f"{{{{E{n}_T}}}}"]     = _t(i, "total")
+        mapa[f"{{{{E{n}_PD}}}}"]    = str(
+            int(teses_df.iloc[i]["vitorias"] + teses_df.iloc[i]["perdas"])
+            if i < len(teses_df) else "—"
+        )
+
+    # Totais teses
+    if not teses_df.empty:
+        mapa["{{NTOT}}"]   = str(int(teses_df["total"].sum()))
+        mapa["{{VTOT}}"]   = str(int(teses_df["vitorias"].sum()))
+        mapa["{{PTOT}}"]   = str(int(teses_df["perdas"].sum()))
+        mapa["{{ATOT}}"]   = str(int(teses_df["em_andamento"].sum()))
+        mapa["{{TTOT}}"]   = "—"
+        mapa["{{VALTOT}}"] = _brl(teses_df["valor"].sum())
+        mapa["{{ETOT}}"]   = str(int(teses_df["total"].sum()))
+        mapa["{{ETOT_VAL}}"] = _brl(teses_df["valor"].sum())
+        mapa["{{ETOT_T}}"] = str(int(teses_df["total"].sum()))
+        mapa["{{ETOT_PD}}"]= str(int((teses_df["vitorias"] + teses_df["perdas"]).sum()))
+    else:
+        for k in ("{{NTOT}}", "{{VTOT}}", "{{PTOT}}", "{{ATOT}}", "{{TTOT}}", "{{VALTOT}}",
+                  "{{ETOT}}", "{{ETOT_VAL}}", "{{ETOT_T}}", "{{ETOT_PD}}"):
+            mapa[k] = "—"
+
+    # Comarcas 1–10
+    for i in range(10):
+        n = i + 1
+        mapa[f"{{{{COMARCA_{n}}}}}"] = _c(i, "comarca_limpa")
+        mapa[f"{{{{C{n}_T}}}}"]      = _c(i, "total")
+        mapa[f"{{{{C{n}_V}}}}"]      = _c(i, "vitorias")
+        mapa[f"{{{{C{n}_P}}}}"]      = _c(i, "perdas")
+        mapa[f"{{{{C{n}_TX}}}}"]     = _c(i, "taxa", "pct")
+        mapa[f"{{{{C{n}_VAL}}}}"]    = _c(i, "valor", "brl")
+
+    # Linha do tempo 1–6
+    for i in range(6):
+        n = i + 1
+        mapa[f"{{{{MES_{n}}}}}"]    = _tmp(i, "mes_str")
+        mapa[f"{{{{TMP{n}_N}}}}"]   = _tmp(i, "novos")
+        mapa[f"{{{{TMP{n}_D}}}}"]   = _tmp(i, "decididos")
+        mapa[f"{{{{TMP{n}_V}}}}"]   = _tmp(i, "vitorias")
+        mapa[f"{{{{TMP{n}_P}}}}"]   = _tmp(i, "perdas")
+        mapa[f"{{{{TMP{n}_A}}}}"]   = _tmp(i, "andamento")
+        mapa[f"{{{{TMP{n}_VAL}}}}"] = _tmp(i, "valor", "brl")
+
+    # Detalhamento 1–10
+    for i in range(10):
+        n = i + 1
+        mapa[f"{{{{PROC_{n}}}}}"]   = _d(i, "processo")
+        mapa[f"{{{{DAJ_{n}}}}}"]    = _d_date(i, "ajuizamento")
+        mapa[f"{{{{TESE_D_{n}}}}}"] = _d(i, "assunto_label")
+        mapa[f"{{{{COM_{n}}}}}"]    = _d(i, "comarca_limpa")
+        mapa[f"{{{{EST_{n}}}}}"]    = _d(i, "status_exito")
+        mapa[f"{{{{RES_{n}}}}}"]    = _d(i, "status_exito")
+        mapa[f"{{{{VAL_D_{n}}}}}"]  = _d(i, "valor", "brl")
+
+    return mapa
+
+
+def _build_mapa_frente2(df_dem: pd.DataFrame, filtros_sidebar: dict) -> dict:
+    """Monta o dicionário de substituição para o relatório da Frente 2."""
+    hoje = date.today().strftime("%d/%m/%Y")
+
+    # ── Metadados ─────────────────────────────────────────────────────────────
+    nucleo_label = ", ".join(filtros_sidebar.get("nucleo", [])) or "Todos os núcleos"
+    periodo_label = "—"
+    if not df_dem.empty:
+        datas = df_dem["conclusao"].dropna()
+        if not datas.empty:
+            periodo_label = (
+                f"{datas.min().strftime('%m/%Y')} a {datas.max().strftime('%m/%Y')}"
+            )
+    filtros_txt_parts = []
+    if filtros_sidebar.get("nucleo"):
+        filtros_txt_parts.append(f"Núcleo: {nucleo_label}")
+    if filtros_sidebar.get("procurador"):
+        filtros_txt_parts.append(
+            "Procurador: " + ", ".join(filtros_sidebar["procurador"])
+        )
+    filtros_label = "; ".join(filtros_txt_parts) or "Sem filtros adicionais"
+
+    # ── KPIs ──────────────────────────────────────────────────────────────────
+    total_dem  = len(df_dem)
+    conc_mask  = df_dem["conclusao"].notna() if not df_dem.empty else pd.Series(dtype=bool)
+    pend_mask  = df_dem["conclusao"].isna()  if not df_dem.empty else pd.Series(dtype=bool)
+    dem_conc   = int(conc_mask.sum())
+    dem_pend   = int(pend_mask.sum())
+    perc_conc  = f"{dem_conc/total_dem*100:.1f}%" if total_dem > 0 else "—"
+    total_h    = df_dem["horas"].sum() if not df_dem.empty else 0.0
+    media_h    = df_dem["horas"].mean() if not df_dem.empty else 0.0
+    qtd_proc   = df_dem["procurador"].nunique() if not df_dem.empty else 0
+    qtd_pub    = int((df_dem["publicou"] == "Sim").sum()) if not df_dem.empty and "publicou" in df_dem.columns else 0
+    qtd_tipos  = df_dem["demanda"].nunique() if not df_dem.empty and "demanda" in df_dem.columns else 0
+
+    # Média de dias (entrada → conclusao)
+    if not df_dem.empty and "entrada" in df_dem.columns and "conclusao" in df_dem.columns:
+        delta = (df_dem["conclusao"] - df_dem["entrada"]).dt.days.dropna()
+        media_dias = f"{delta.mean():.0f}" if not delta.empty else "—"
+    else:
+        media_dias = "—"
+
+    # ── Produtividade por procurador (top 10) ─────────────────────────────────
+    if not df_dem.empty and "procurador" in df_dem.columns:
+        prod_df = (
+            df_dem.groupby("procurador")
+            .agg(
+                concluidas  = ("conclusao", lambda x: x.notna().sum()),
+                pendentes   = ("conclusao", lambda x: x.isna().sum()),
+                horas       = ("horas",     "sum"),
+                publicacoes = ("publicou",  lambda x: (x == "Sim").sum()),
+            )
+            .assign(
+                total       = lambda d: d["concluidas"] + d["pendentes"],
+                media_horas = lambda d: (d["horas"] / d["total"]).where(d["total"] > 0).fillna(0).round(1),
+            )
+            .sort_values("total", ascending=False)
+            .head(10)
+            .reset_index()
+        )
+    else:
+        prod_df = pd.DataFrame()
+
+    def _p(i, col, fmt=None):
+        if i < len(prod_df):
+            val = prod_df.iloc[i][col]
+            return f"{val:.1f}" if fmt == "f1" else str(int(val)) if fmt == "int" else str(val)
+        return "—"
+
+    # ── Fluxo mensal (últimos 6 meses por conclusao) ───────────────────────────
+    if not df_dem.empty and "conclusao" in df_dem.columns and "entrada" in df_dem.columns:
+        conc_v = df_dem.dropna(subset=["conclusao"]).copy()
+        ent_v  = df_dem.dropna(subset=["entrada"]).copy()
+        conc_v["mes"] = conc_v["conclusao"].dt.to_period("M")
+        ent_v["mes"]  = ent_v["entrada"].dt.to_period("M")
+        conc_mes = conc_v.groupby("mes").size().rename("conc")
+        ent_mes  = ent_v.groupby("mes").size().rename("ent")
+        flux_df  = pd.concat([ent_mes, conc_mes], axis=1).fillna(0)
+        flux_df["saldo"] = flux_df["conc"] - flux_df["ent"]
+        flux_df["sacum"] = flux_df["saldo"].cumsum()
+        flux_df["pend"]  = df_dem.groupby(
+            df_dem["entrada"].dt.to_period("M")
+        ).apply(lambda g: g["conclusao"].isna().sum(), include_groups=False).reindex(flux_df.index).fillna(0)
+        flux_df = flux_df.tail(6).reset_index()
+        flux_df["mes_str"] = flux_df["mes"].astype(str)
+    else:
+        flux_df = pd.DataFrame()
+
+    def _fl(i, col):
+        if i < len(flux_df):
+            val = flux_df.iloc[i][col]
+            return str(int(val)) if isinstance(val, float) else str(val)
+        return "—"
+
+    # ── Tipos de demanda (top 8) ───────────────────────────────────────────────
+    if not df_dem.empty and "demanda" in df_dem.columns:
+        tipo_df = (
+            df_dem.groupby("demanda")
+            .agg(
+                n    = ("demanda",   "count"),
+                pend = ("conclusao", lambda x: x.isna().sum()),
+            )
+            .sort_values("n", ascending=False)
+            .head(8)
+            .reset_index()
+        )
+    else:
+        tipo_df = pd.DataFrame()
+
+    def _td(i, col):
+        if i < len(tipo_df):
+            return str(tipo_df.iloc[i][col])
+        return "—"
+
+    # ── Sazonalidade (por mês do ano, usando entrada) ─────────────────────────
+    _meses_abrev = ["JAN","FEV","MAR","ABR","MAI","JUN",
+                    "JUL","AGO","SET","OUT","NOV","DEZ"]
+    if not df_dem.empty and "entrada" in df_dem.columns:
+        saz = df_dem.dropna(subset=["entrada"]).copy()
+        saz["mes_num"] = saz["entrada"].dt.month
+        saz_agg = (
+            saz.groupby("mes_num")
+            .agg(ent=("entrada","count"), horas=("horas","sum"))
+            .reindex(range(1,13), fill_value=0)
+        )
+    else:
+        saz_agg = pd.DataFrame({"ent": [0]*12, "horas": [0.0]*12}, index=range(1,13))
+
+    # ── Gargalos — 10 demandas pendentes mais antigas ────────────────────────
+    if not df_dem.empty and "entrada" in df_dem.columns:
+        garg_df = (
+            df_dem[df_dem["conclusao"].isna()]
+            .dropna(subset=["entrada"])
+            .copy()
+        )
+        garg_df["dias"] = (pd.Timestamp(date.today()) - garg_df["entrada"]).dt.days
+        garg_df = garg_df.nlargest(10, "dias").reset_index(drop=True)
+    else:
+        garg_df = pd.DataFrame()
+
+    def _g(i, col, fmt=None):
+        if i < len(garg_df):
+            val = garg_df.iloc[i].get(col, "—")
+            if pd.isna(val) if not isinstance(val, str) else (val == ""):
+                return "—"
+            return val.strftime("%d/%m/%Y") if fmt == "date" and hasattr(val, "strftime") else str(val)
+        return "—"
+
+    # ── Histórico 12 meses ────────────────────────────────────────────────────
+    if not df_dem.empty and "conclusao" in df_dem.columns:
+        hist_c = df_dem.dropna(subset=["conclusao"]).copy()
+        hist_e = df_dem.dropna(subset=["entrada"]).copy()
+        hist_c["mes"] = hist_c["conclusao"].dt.to_period("M")
+        hist_e["mes"] = hist_e["entrada"].dt.to_period("M")
+        hist_conc = hist_c.groupby("mes").agg(
+            conc=("conclusao","count"), horas=("horas","sum"),
+            pub=("publicou", lambda x: (x=="Sim").sum()),
+        )
+        hist_ent = hist_e.groupby("mes").size().rename("ent")
+        hist_df  = pd.concat([hist_ent, hist_conc], axis=1).fillna(0)
+        hist_df["mh"]  = (hist_df["horas"] / hist_df["conc"].replace(0, pd.NA)).fillna(0).round(1)
+        hist_df["tx"]  = (hist_df["conc"] / (hist_df["ent"] + hist_df["conc"]).replace(0, pd.NA) * 100).fillna(0).round(1)
+        hist_df = hist_df.tail(12).reset_index()
+        hist_df["mes_str"] = hist_df["mes"].astype(str)
+    else:
+        hist_df = pd.DataFrame()
+
+    def _h(i, col, fmt=None):
+        if i < len(hist_df):
+            val = hist_df.iloc[i][col]
+            return f"{val:.1f}" if fmt == "f1" else str(int(val)) if fmt == "int" else str(val)
+        return "—"
+
+    # ── Mapa final ────────────────────────────────────────────────────────────
+    mapa: dict = {
+        "{{DATA_GERACAO}}":      hoje,
+        "{{NUCLEO}}":            nucleo_label,
+        "{{PERIODO}}":           periodo_label,
+        "{{FILTROS_APLICADOS}}": filtros_label,
+
+        # KPIs
+        "{{TOTAL_DEMANDAS}}":  f"{total_dem:,}".replace(",", "."),
+        "{{DEMANDAS_CONC}}":   f"{dem_conc:,}".replace(",", "."),
+        "{{PERC_CONC}}":       perc_conc,
+        "{{DEMANDAS_PEND}}":   f"{dem_pend:,}".replace(",", "."),
+        "{{TOTAL_HORAS}}":     f"{total_h:,.1f}".replace(",", "."),
+        "{{MEDIA_HORAS}}":     f"{media_h:.1f}",
+        "{{QTD_PROC}}":        str(qtd_proc),
+        "{{QTD_PUBLICACOES}}": str(qtd_pub),
+        "{{QTD_TIPOS}}":       str(qtd_tipos),
+        "{{MEDIA_DIAS}}":      media_dias,
+    }
+
+    # Produtividade por procurador 1–10
+    for i in range(10):
+        n = i + 1
+        mapa[f"{{{{PROC_{n}}}}}"]   = _p(i, "procurador")
+        mapa[f"{{{{PC{n}_CONC}}}}"] = _p(i, "concluidas", "int")
+        mapa[f"{{{{PC{n}_PEND}}}}"] = _p(i, "pendentes",  "int")
+        mapa[f"{{{{PC{n}_TOT}}}}"]  = _p(i, "total",      "int")
+        mapa[f"{{{{PC{n}_H}}}}"]    = _p(i, "horas",      "f1")
+        mapa[f"{{{{PC{n}_MH}}}}"]   = _p(i, "media_horas","f1")
+        mapa[f"{{{{PC{n}_PUB}}}}"]  = _p(i, "publicacoes","int")
+
+    # Totais produtividade
+    if not prod_df.empty:
+        mapa["{{PTOT_CONC}}"] = str(int(prod_df["concluidas"].sum()))
+        mapa["{{PTOT_PEND}}"] = str(int(prod_df["pendentes"].sum()))
+        mapa["{{PTOT_TOT}}"]  = str(int(prod_df["total"].sum()))
+        mapa["{{PTOT_H}}"]    = f"{prod_df['horas'].sum():.1f}"
+        mapa["{{PTOT_MH}}"]   = f"{prod_df['media_horas'].mean():.1f}"
+        mapa["{{PTOT_PUB}}"]  = str(int(prod_df["publicacoes"].sum()))
+    else:
+        for k in ("{{PTOT_CONC}}","{{PTOT_PEND}}","{{PTOT_TOT}}","{{PTOT_H}}","{{PTOT_MH}}","{{PTOT_PUB}}"):
+            mapa[k] = "—"
+
+    # Fluxo mensal 1–6
+    for i in range(6):
+        n = i + 1
+        mapa[f"{{{{MES_{n}}}}}"]     = _fl(i, "mes_str")
+        mapa[f"{{{{FL{n}_ENT}}}}"]   = _fl(i, "ent")
+        mapa[f"{{{{FL{n}_CONC}}}}"]  = _fl(i, "conc")
+        mapa[f"{{{{FL{n}_SALD}}}}"]  = _fl(i, "saldo")
+        mapa[f"{{{{FL{n}_SACUM}}}}"] = _fl(i, "sacum")
+        mapa[f"{{{{FL{n}_PEND}}}}"]  = _fl(i, "pend")
+
+    # Totais fluxo
+    if not flux_df.empty:
+        mapa["{{FLTOT_ENT}}"]  = str(int(flux_df["ent"].sum()))
+        mapa["{{FLTOT_CONC}}"] = str(int(flux_df["conc"].sum()))
+        mapa["{{FLTOT_SALD}}"] = str(int(flux_df["saldo"].sum()))
+        mapa["{{FLTOT_PEND}}"] = str(int(flux_df["pend"].sum()))
+    else:
+        for k in ("{{FLTOT_ENT}}","{{FLTOT_CONC}}","{{FLTOT_SALD}}","{{FLTOT_PEND}}"):
+            mapa[k] = "—"
+
+    # Tipos de demanda 1–8
+    for i in range(8):
+        n = i + 1
+        mapa[f"{{{{TIPO_{n}}}}}"] = _td(i, "demanda")
+        mapa[f"{{{{TD{n}_N}}}}"]  = _td(i, "n")
+        mapa[f"{{{{TD{n}_P}}}}"]  = _td(i, "pend")
+
+    # Sazonalidade (12 meses)
+    for i, abrev in enumerate(_meses_abrev):
+        idx = i + 1
+        row = saz_agg.loc[idx] if idx in saz_agg.index else None
+        mapa[f"{{{{SAZ_{abrev}_ENT}}}}"] = str(int(row["ent"]))   if row is not None else "0"
+        mapa[f"{{{{SAZ_{abrev}_H}}}}"]   = f"{row['horas']:.1f}" if row is not None else "0.0"
+
+    # Gargalos 1–10
+    for i in range(10):
+        n = i + 1
+        mapa[f"{{{{GARG{n}_PROC}}}}"] = _g(i, "processo_base")
+        mapa[f"{{{{GARG{n}_PCR}}}}"]  = _g(i, "procurador")
+        mapa[f"{{{{GARG{n}_TIPO}}}}"] = _g(i, "demanda")
+        mapa[f"{{{{GARG{n}_ENT}}}}"]  = _g(i, "entrada", "date")
+        mapa[f"{{{{GARG{n}_DIAS}}}}"] = _g(i, "dias")
+        mapa[f"{{{{GARG{n}_MAT}}}}"]  = _g(i, "materia")
+
+    # Histórico 12 meses
+    for i in range(12):
+        n = i + 1
+        mapa[f"{{{{HIST_MES_{n}}}}}"]  = _h(i, "mes_str")
+        mapa[f"{{{{HIST{n}_ENT}}}}"]   = _h(i, "ent",  "int")
+        mapa[f"{{{{HIST{n}_CONC}}}}"]  = _h(i, "conc", "int")
+        mapa[f"{{{{HIST{n}_H}}}}"]     = _h(i, "horas","f1")
+        mapa[f"{{{{HIST{n}_MH}}}}"]    = _h(i, "mh",   "f1")
+        mapa[f"{{{{HIST{n}_PUB}}}}"]   = _h(i, "pub",  "int")
+        mapa[f"{{{{HIST{n}_TX}}}}"]    = _h(i, "tx",   "f1")
+
+    # Totais histórico
+    if not hist_df.empty:
+        mapa["{{HTTOT_ENT}}"]  = str(int(hist_df["ent"].sum()))
+        mapa["{{HTTOT_CONC}}"] = str(int(hist_df["conc"].sum()))
+        mapa["{{HTTOT_H}}"]    = f"{hist_df['horas'].sum():.1f}"
+        mapa["{{HTTOT_MH}}"]   = f"{hist_df['mh'].mean():.1f}"
+        mapa["{{HTTOT_PUB}}"]  = str(int(hist_df["pub"].sum()))
+        tot_ent_h = int(hist_df["ent"].sum() + hist_df["conc"].sum())
+        mapa["{{HTTOT_TX}}"]   = (
+            f"{hist_df['conc'].sum() / tot_ent_h * 100:.1f}"
+            if tot_ent_h > 0 else "—"
+        )
+    else:
+        for k in ("{{HTTOT_ENT}}","{{HTTOT_CONC}}","{{HTTOT_H}}",
+                  "{{HTTOT_MH}}","{{HTTOT_PUB}}","{{HTTOT_TX}}"):
+            mapa[k] = "—"
+
+    return mapa
+
+
+def _botao_relatorio(template_name: str, mapa: dict, label: str, filename: str) -> None:
+    """Renderiza o botão de download do relatório Word."""
+    template_path = Path(__file__).parent / template_name
+    if not mapa:
+        st.warning("Sem dados para gerar o relatório.", icon="⚠️")
+        return
+    col_btn, _ = st.columns([1, 3])
+    with col_btn:
+        dados = _gerar_relatorio(template_path, mapa)
+        if dados:
+            st.download_button(
+                label=label,
+                data=dados,
+                file_name=filename,
+                mime=(
+                    "application/vnd.openxmlformats-officedocument"
+                    ".wordprocessingml.document"
+                ),
+                use_container_width=True,
+            )
+
+# =============================================================================
 # PONTO DE ENTRADA
 # =============================================================================
 
@@ -2945,6 +3547,18 @@ def main() -> None:
         with s6:
             _subtab_f1_detalhamento(df)
 
+        st.markdown('<hr class="divider">', unsafe_allow_html=True)
+        if df.empty:
+            st.warning("Sem dados de processos para gerar o relatório.", icon="⚠️")
+        else:
+            mapa_f1 = _build_mapa_frente1(df, filtros_sidebar)
+            _botao_relatorio(
+                "Esqueleto_Relatorio_Frente1.docx",
+                mapa_f1,
+                "📄 Gerar Relatório — Frente 1",
+                f"Relatorio_F1_{date.today().strftime('%Y%m%d')}.docx",
+            )
+
     with tab_op:
         o1, o2, o3, o4, o5, o6 = st.tabs([
             "Performance dos Núcleos",
@@ -2966,6 +3580,18 @@ def main() -> None:
             _subtab_f2_procuradores(df_dem_filtered)
         with o6:
             _subtab_f2_timeline(df, df_dem_full)
+
+        st.markdown('<hr class="divider">', unsafe_allow_html=True)
+        if df_dem_filtered.empty:
+            st.warning("Sem dados de demandas para gerar o relatório.", icon="⚠️")
+        else:
+            mapa_f2 = _build_mapa_frente2(df_dem_filtered, filtros_sidebar)
+            _botao_relatorio(
+                "Esqueleto_Relatorio_Frente2.docx",
+                mapa_f2,
+                "📄 Gerar Relatório — Frente 2",
+                f"Relatorio_F2_{date.today().strftime('%Y%m%d')}.docx",
+            )
 
     with tab_admin:
         _tab_upload()
