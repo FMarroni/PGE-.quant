@@ -177,6 +177,25 @@ def _converter_demandas_tipos(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _extrair_oab(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extrai advogado_principal e oab_principal da coluna 'advogados'.
+    Formato esperado: "Advogado: Nome (OAB: 123456/SP)"
+    Captura apenas o primeiro match por linha (advogado principal da pasta).
+    """
+    if "advogados" not in df.columns:
+        df["advogado_principal"] = None
+        df["oab_principal"]      = None
+        return df
+    extraido = df["advogados"].str.extract(
+        r'(?i)Advogado[a-z]*:\s*(.*?)\s*\(OAB:\s*(.*?)\)',
+        expand=True,
+    )
+    df["advogado_principal"] = extraido[0]
+    df["oab_principal"]      = extraido[1]
+    return df
+
+
 # =============================================================================
 # CAPÍTULO 5 – AGREGAÇÃO POR PASTA
 # =============================================================================
@@ -329,6 +348,8 @@ CREATE TABLE IF NOT EXISTS pastas_consolidadas (
     outras_partes_ativas        TEXT,
     outras_partes_passivas      TEXT,
     advogados                   TEXT,
+    advogado_principal          TEXT,
+    oab_principal               TEXT,
     ult_andamento_judicial       TEXT,
     data_do_andamento           TEXT,
     tramitacao                  TEXT,
@@ -387,7 +408,8 @@ _COLUNAS_SCHEMA_PASTA = (
     "materia", "assuntos", "tribunal", "unidade_judicial", "vara",
     "polo_pge", "qualificacao", "parte_representada", "documento_parte_rep",
     "parte_contraria", "documento", "outras_partes_ativas",
-    "outras_partes_passivas", "advogados", "ult_andamento_judicial",
+    "outras_partes_passivas", "advogados", "advogado_principal", "oab_principal",
+    "ult_andamento_judicial",
     "data_do_andamento", "tramitacao", "situacao", "unidade", "mesa",
     "tipo_distribuicao", "num_dividas", "soma_val_atualizados",
     "status_exito", "nucleo", "data_ultima_atualizacao",
@@ -507,6 +529,8 @@ def salvar_no_banco(
             ("ult_demanda",          "TEXT"),
             ("data_ultima_demanda",  "TEXT"),
             ("total_horas",          "REAL"),
+            ("advogado_principal",   "TEXT"),
+            ("oab_principal",        "TEXT"),
         ]:
             _db.add_column_if_not_exists(cur, "pastas_consolidadas", col, tipo)
         _db.add_column_if_not_exists(cur, "controle_uploads", "nucleo", "TEXT")
@@ -582,6 +606,7 @@ def processar_processos(caminho_arquivo: str | Path) -> pd.DataFrame:
     df = _normalizar_nomes(df, MAPA_COLUNAS)
     df = _converter_datas_processos(df)
     df = _converter_valor_financeiro(df)
+    df = _extrair_oab(df)
     # Classifica status antes da agregação: todos os processos filhos ainda visíveis
     status_pasta = _classificar_status_pasta(df)
     df = _agregar_por_pasta(df)

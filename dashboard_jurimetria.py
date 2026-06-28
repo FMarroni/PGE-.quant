@@ -322,6 +322,8 @@ CREATE TABLE IF NOT EXISTS pastas_consolidadas (
     outras_partes_ativas        TEXT,
     outras_partes_passivas      TEXT,
     advogados                   TEXT,
+    advogado_principal          TEXT,
+    oab_principal               TEXT,
     ult_andamento_judicial       TEXT,
     data_do_andamento           TEXT,
     tramitacao                  TEXT,
@@ -380,7 +382,8 @@ _COLUNAS_SCHEMA_DB = (
     "materia", "assuntos", "tribunal", "unidade_judicial", "vara",
     "polo_pge", "qualificacao", "parte_representada", "documento_parte_rep",
     "parte_contraria", "documento", "outras_partes_ativas",
-    "outras_partes_passivas", "advogados", "ult_andamento_judicial",
+    "outras_partes_passivas", "advogados", "advogado_principal", "oab_principal",
+    "ult_andamento_judicial",
     "data_do_andamento", "tramitacao", "situacao", "unidade", "mesa",
     "tipo_distribuicao", "num_dividas", "soma_val_atualizados",
     "status_exito", "nucleo", "data_ultima_atualizacao",
@@ -462,6 +465,8 @@ def _migrar_banco() -> None:
             ("ult_demanda",          "TEXT"),
             ("data_ultima_demanda",  "TEXT"),
             ("total_horas",          "REAL"),
+            ("advogado_principal",   "TEXT"),
+            ("oab_principal",        "TEXT"),
         ]:
             _db.add_column_if_not_exists(cur, "pastas_consolidadas", col, tipo)
         _db.add_column_if_not_exists(cur, "controle_uploads", "nucleo", "TEXT")
@@ -653,6 +658,18 @@ def processar_upload(
     df["pasta"]    = df["pasta"].str.strip()
     df["processo"] = df["processo"].str.strip()
 
+    # Extrai advogado e OAB antes do groupby (acesso a todos os processos filhos)
+    if "advogados" in df.columns:
+        _extraido = df["advogados"].str.extract(
+            r'(?i)Advogado[a-z]*:\s*(.*?)\s*\(OAB:\s*(.*?)\)',
+            expand=True,
+        )
+        df["advogado_principal"] = _extraido[0]
+        df["oab_principal"]      = _extraido[1]
+    else:
+        df["advogado_principal"] = None
+        df["oab_principal"]      = None
+
     # Classifica status antes da agregação (todos os processos filhos visíveis)
     status_pasta = _calcular_status_pasta(df)
 
@@ -788,6 +805,8 @@ def processar_upload(
             ("ult_demanda",          "TEXT"),
             ("data_ultima_demanda",  "TEXT"),
             ("total_horas",          "REAL"),
+            ("advogado_principal",   "TEXT"),
+            ("oab_principal",        "TEXT"),
         ]:
             _db.add_column_if_not_exists(cur, "pastas_consolidadas", col, tipo)
         _db.add_column_if_not_exists(cur, "controle_uploads", "nucleo", "TEXT")
