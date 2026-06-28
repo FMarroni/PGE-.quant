@@ -387,12 +387,13 @@ _COLUNAS_SCHEMA_DB = (
     "procurador", "ult_demanda", "data_ultima_demanda", "total_horas",
 )
 
-# status_exito não atualizado pelo UPSERT do Arquivo A; é derivado do Arquivo B
+# status_exito atualizado pelo UPSERT do Arquivo A (derivado de classe/polo_pge/situacao)
 _COLUNAS_ATUALIZAVEIS = (
     "processos_vinculados",
     "valor",
     "tramitacao",
     "situacao",
+    "status_exito",
     "nucleo",
     "data_ultima_atualizacao",
 )
@@ -404,11 +405,41 @@ _COLUNAS_DEMANDAS_DB = (
     "publicou", "nucleo", "data_upload",
 )
 
-_REGRAS_EXITO: list[tuple[str, str]] = [
-    ("Favorável ao Estado",               "Vitória"),
-    ("Extinção sem julgamento do mérito", "Vitória"),
-    ("Desfavorável ao Estado",            "Perda"),
-]
+def _calcular_status_pasta(df_proc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Classifica status_exito por pasta com base no Arquivo A (processos).
+    Opera sobre o DataFrame bruto (pré-agregação). Retorna ['pasta', 'status_exito'].
+
+    Hierarquia:
+    1. PERDA  — algum processo tem Classe 'RPV' ou 'Precatório'
+    2. PERDA  — algum processo tem Classe 'Cumprimento' e Polo PGE 'Passivo'
+    3. EM ANDAMENTO — algum processo ainda 'Ativo'
+    4. VITÓRIA — sem execução passiva, todos encerrados
+    """
+
+    def _regra(grupo: pd.DataFrame) -> str:
+        classe   = grupo["classe"].str.strip()   if "classe"   in grupo.columns else pd.Series(dtype=str)
+        polo     = grupo["polo_pge"].str.strip() if "polo_pge" in grupo.columns else pd.Series(dtype=str)
+        situacao = grupo["situacao"].str.strip() if "situacao" in grupo.columns else pd.Series(dtype=str)
+
+        if classe.str.contains(r"RPV|Precatório|Precatorio", case=False, na=False, regex=True).any():
+            return "Perda"
+
+        mask_cump = classe.str.contains("Cumprimento", case=False, na=False)
+        if mask_cump.any():
+            if polo[mask_cump.values].str.contains("Passivo", case=False, na=False).any():
+                return "Perda"
+
+        if situacao.str.contains("Ativo", case=False, na=False).any():
+            return "Em Andamento"
+
+        return "Vitória"
+
+    return (
+        df_proc.groupby("pasta", sort=False)
+        .apply(_regra)
+        .reset_index(name="status_exito")
+    )
 
 # =============================================================================
 # MIGRAÇÃO DE BANCO
@@ -622,6 +653,9 @@ def processar_upload(
     df["pasta"]    = df["pasta"].str.strip()
     df["processo"] = df["processo"].str.strip()
 
+    # Classifica status antes da agregação (todos os processos filhos visíveis)
+    status_pasta = _calcular_status_pasta(df)
+
     colunas_excluir = {"pasta", "processo", "valor", "ajuizamento"}
     colunas_first   = [c for c in df.columns if c not in colunas_excluir]
     agg: dict = {
@@ -632,9 +666,10 @@ def processar_upload(
     agg.update({c: "first" for c in colunas_first})
     df = df.groupby("pasta", as_index=False, sort=False).agg(agg)
     df = df.rename(columns={"processo": "processos_vinculados"})
+    df = df.merge(status_pasta, on="pasta", how="left")
+    df["status_exito"] = df["status_exito"].fillna("Em Andamento")
 
     df["nucleo"] = nome_nucleo
-    df["status_exito"] = "Em Andamento"
     df["data_ultima_atualizacao"] = datetime.now().isoformat(timespec="seconds")
 
     for col in ("ajuizamento", "cadastro"):
@@ -691,21 +726,6 @@ def processar_upload(
     else:
         total_horas = pd.DataFrame(columns=["pasta", "total_horas"])
 
-    def _classif_exito_serie(series_list: list) -> str:
-        for dem in series_list:
-            if not dem or pd.isna(dem):
-                continue
-            for frag, status in _REGRAS_EXITO:
-                if frag in str(dem):
-                    return status
-        return "Em Andamento"
-
-    status_por_pasta = (
-        df_sorted.groupby("pasta", sort=False)["demanda"]
-        .apply(lambda s: _classif_exito_serie(s.tolist()))
-        .reset_index(name="status_exito")
-    ) if "demanda" in df_sorted.columns else pd.DataFrame(columns=["pasta", "status_exito"])
-
     df_deriv = mais_recente[["pasta"]].copy()
     df_deriv["ult_demanda"] = (
         mais_recente["demanda"].values if "demanda" in mais_recente.columns else None
@@ -717,10 +737,8 @@ def processar_upload(
     df_deriv["procurador"] = (
         mais_recente["procurador"].values if "procurador" in mais_recente.columns else None
     )
-    df_deriv = df_deriv.merge(total_horas,     on="pasta", how="left")
-    df_deriv = df_deriv.merge(status_por_pasta, on="pasta", how="left")
-    df_deriv["total_horas"]  = df_deriv.get("total_horas",  pd.Series(dtype=float)).fillna(0.0)
-    df_deriv["status_exito"] = df_deriv.get("status_exito", pd.Series(dtype=str)).fillna("Em Andamento")
+    df_deriv = df_deriv.merge(total_horas, on="pasta", how="left")
+    df_deriv["total_horas"] = df_deriv.get("total_horas", pd.Series(dtype=float)).fillna(0.0)
     df_deriv = df_deriv.where(pd.notnull(df_deriv), other=None)
 
     update_records = [
@@ -729,7 +747,6 @@ def processar_upload(
             row["ult_demanda"],
             row["data_ultima_demanda"],
             row.get("total_horas"),
-            row["status_exito"],
             ts,
             row["pasta"],
         )
@@ -753,7 +770,7 @@ def processar_upload(
     sql_update_deriv = (
         f"UPDATE pastas_consolidadas "
         f"SET procurador = {_p}, ult_demanda = {_p}, data_ultima_demanda = {_p}, "
-        f"    total_horas = {_p}, status_exito = {_p}, data_ultima_atualizacao = {_p} "
+        f"    total_horas = {_p}, data_ultima_atualizacao = {_p} "
         f"WHERE pasta = {_p}"
     )
 

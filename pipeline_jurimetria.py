@@ -213,32 +213,58 @@ def _agregar_por_pasta(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# CAPÍTULO 6 – REGRAS DE NEGÓCIO: STATUS DE ÊXITO
+# CAPÍTULO 6 – REGRAS DE NEGÓCIO: STATUS DA PASTA
 # =============================================================================
 
-_REGRAS_EXITO: list[tuple[str, str]] = [
-    ("Favorável ao Estado",               "Vitória"),
-    ("Extinção sem julgamento do mérito", "Vitória"),
-    ("Desfavorável ao Estado",            "Perda"),
-]
+def _classificar_status_pasta(df_proc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Classifica status_exito de cada pasta com base no Arquivo A (processos).
+    Opera sobre o DataFrame bruto (pré-agregação), avaliando todos os processos
+    filhos da pasta. Retorna DataFrame com colunas ['pasta', 'status_exito'].
 
+    Hierarquia de regras (da mais grave à mais leve):
+    1. PERDA  — algum processo tem Classe "RPV" ou "Precatório" (execução fiscal passiva)
+    2. PERDA  — algum processo tem Classe "Cumprimento" e Polo PGE "Passivo"
+                (Estado executado por obrigação principal ou honorários sucumbenciais)
+    3. EM ANDAMENTO — nenhuma execução passiva, mas algum processo está "Ativo"
+    4. VITÓRIA — sem execução passiva e todos os processos encerrados/baixados
+    """
 
-def _classificar_exito_serie(demandas_list: list) -> str:
-    """Itera do mais recente para o mais antigo e retorna o primeiro status identificado."""
-    for dem in demandas_list:
-        if not dem or pd.isna(dem):
-            continue
-        for frag, status in _REGRAS_EXITO:
-            if frag in str(dem):
-                return status
-    return "Em Andamento"
+    def _regra(grupo: pd.DataFrame) -> str:
+        classe   = grupo["classe"].str.strip()   if "classe"   in grupo.columns else pd.Series(dtype=str)
+        polo     = grupo["polo_pge"].str.strip() if "polo_pge" in grupo.columns else pd.Series(dtype=str)
+        situacao = grupo["situacao"].str.strip() if "situacao" in grupo.columns else pd.Series(dtype=str)
+
+        # Regra 1: RPV ou Precatório → Perda direta
+        if classe.str.contains(r"RPV|Precatório|Precatorio", case=False, na=False, regex=True).any():
+            return "Perda"
+
+        # Regra 2: Cumprimento de Sentença com polo passivo → Perda
+        mask_cump = classe.str.contains("Cumprimento", case=False, na=False)
+        if mask_cump.any():
+            polo_cump = polo[mask_cump.values]
+            if polo_cump.str.contains("Passivo", case=False, na=False).any():
+                return "Perda"
+
+        # Regra 3: Algum processo ativo (tramitando) → Em Andamento
+        if situacao.str.contains("Ativo", case=False, na=False).any():
+            return "Em Andamento"
+
+        # Regra 4: Sem execução passiva, todos encerrados → Vitória
+        return "Vitória"
+
+    return (
+        df_proc.groupby("pasta", sort=False)
+        .apply(_regra)
+        .reset_index(name="status_exito")
+    )
 
 
 def _derivar_campos_demandas(df_dem: pd.DataFrame) -> pd.DataFrame:
     """
-    A partir do DataFrame de demandas (com conclusao como datetime),
-    deriva por pasta: ult_demanda, data_ultima_demanda, procurador,
-    total_horas, status_exito.
+    A partir do DataFrame de demandas, deriva por pasta:
+    ult_demanda, data_ultima_demanda, procurador, total_horas.
+    status_exito é derivado do Arquivo A por _classificar_status_pasta.
     """
     if "pasta" not in df_dem.columns:
         raise KeyError("Coluna 'pasta' não encontrada no DataFrame de demandas.")
@@ -254,15 +280,6 @@ def _derivar_campos_demandas(df_dem: pd.DataFrame) -> pd.DataFrame:
     else:
         total_horas = pd.DataFrame(columns=["pasta", "total_horas"])
 
-    if "demanda" in df_sorted.columns:
-        status_por_pasta = (
-            df_sorted.groupby("pasta", sort=False)["demanda"]
-            .apply(lambda s: _classificar_exito_serie(s.tolist()))
-            .reset_index(name="status_exito")
-        )
-    else:
-        status_por_pasta = pd.DataFrame(columns=["pasta", "status_exito"])
-
     df_deriv = mais_recente[["pasta"]].copy()
     df_deriv["ult_demanda"] = (
         mais_recente["demanda"].values if "demanda" in mais_recente.columns else None
@@ -276,10 +293,8 @@ def _derivar_campos_demandas(df_dem: pd.DataFrame) -> pd.DataFrame:
         mais_recente["procurador"].values if "procurador" in mais_recente.columns else None
     )
 
-    df_deriv = df_deriv.merge(total_horas,     on="pasta", how="left")
-    df_deriv = df_deriv.merge(status_por_pasta, on="pasta", how="left")
-    df_deriv["total_horas"]  = df_deriv.get("total_horas",  pd.Series(dtype=float)).fillna(0.0)
-    df_deriv["status_exito"] = df_deriv.get("status_exito", pd.Series(dtype=str)).fillna("Em Andamento")
+    df_deriv = df_deriv.merge(total_horas, on="pasta", how="left")
+    df_deriv["total_horas"] = df_deriv.get("total_horas", pd.Series(dtype=float)).fillna(0.0)
     df_deriv = df_deriv.where(pd.notnull(df_deriv), other=None)
 
     log.info("Derivação concluída | pastas_com_demandas=%d", len(df_deriv))
@@ -384,12 +399,13 @@ _COLUNAS_SCHEMA_DEM = (
     "publicou", "nucleo", "data_upload",
 )
 
-# status_exito não é atualizado pelo UPSERT do Arquivo A — vem da derivação do Arquivo B
+# status_exito atualizado pelo UPSERT do Arquivo A (derivado de classe/polo_pge/situacao)
 _COLUNAS_ATUALIZAVEIS = (
     "processos_vinculados",
     "valor",
     "tramitacao",
     "situacao",
+    "status_exito",
     "nucleo",
     "data_ultima_atualizacao",
 )
@@ -401,7 +417,6 @@ def _preparar_df_pastas(df: pd.DataFrame, nome_nucleo: str | None) -> pd.DataFra
         if col in df.columns and pd.api.types.is_datetime64_any_dtype(df[col]):
             df[col] = df[col].dt.strftime("%Y-%m-%d")
     df["data_ultima_atualizacao"] = datetime.now().isoformat(timespec="seconds")
-    df["status_exito"] = "Em Andamento"
     if nome_nucleo:
         df["nucleo"] = nome_nucleo
     return df.where(pd.notnull(df), other=None)
@@ -473,7 +488,7 @@ def salvar_no_banco(
     sql_update_deriv = (
         f"UPDATE pastas_consolidadas "
         f"SET procurador = {_p}, ult_demanda = {_p}, data_ultima_demanda = {_p}, "
-        f"    total_horas = {_p}, status_exito = {_p}, data_ultima_atualizacao = {_p} "
+        f"    total_horas = {_p}, data_ultima_atualizacao = {_p} "
         f"WHERE pasta = {_p}"
     )
 
@@ -524,7 +539,6 @@ def salvar_no_banco(
                 row["ult_demanda"],
                 row["data_ultima_demanda"],
                 row.get("total_horas"),
-                row["status_exito"],
                 ts,
                 row["pasta"],
             )
@@ -566,7 +580,11 @@ def processar_processos(caminho_arquivo: str | Path) -> pd.DataFrame:
     df = _normalizar_nomes(df, MAPA_COLUNAS)
     df = _converter_datas_processos(df)
     df = _converter_valor_financeiro(df)
+    # Classifica status antes da agregação: todos os processos filhos ainda visíveis
+    status_pasta = _classificar_status_pasta(df)
     df = _agregar_por_pasta(df)
+    df = df.merge(status_pasta, on="pasta", how="left")
+    df["status_exito"] = df["status_exito"].fillna("Em Andamento")
     log.info("Pipeline processos concluída | pastas=%d", len(df))
     return df
 
@@ -647,11 +665,11 @@ if __name__ == "__main__":
     print(f"Demandas          : {len(df_dem):>10,}")
     print(f"Pastas c/ dem.    : {df_deriv['pasta'].nunique():>10,}")
 
-    print("\nStatus de Êxito (derivado):")
-    print(df_deriv["status_exito"].value_counts().to_string())
+    print("\nStatus de Êxito (por pasta):")
+    print(df_pasta["status_exito"].value_counts().to_string())
 
     print("\nAmostra de derivação (5 primeiros):")
-    colunas_amostra = ["pasta", "procurador", "ult_demanda", "total_horas", "status_exito"]
+    colunas_amostra = ["pasta", "procurador", "ult_demanda", "total_horas"]
     cols_ex = [c for c in colunas_amostra if c in df_deriv.columns]
     print(df_deriv[cols_ex].head().to_string(index=False))
 
