@@ -14,3 +14,10 @@ __pycache__/
 
 # Pacotes zipados de distribuição
 *.zip
+
+# Node.js — dependências locais
+node_modules/
+package-lock.json
+
+# Vídeos — arquivos grandes, não versionar
+*.mp4
