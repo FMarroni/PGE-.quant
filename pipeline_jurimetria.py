@@ -457,7 +457,7 @@ def salvar_no_banco(
         for _, row in df_deriv.iterrows()
     ]
 
-    db_label = "PostgreSQL" if _db.is_postgres() else str(nome_banco)
+    db_label = str(nome_banco)
     con = _db.connect()
     try:
         cur = con.cursor()
