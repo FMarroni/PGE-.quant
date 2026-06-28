@@ -1955,7 +1955,7 @@ def _subtab_f1_estagio(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
         "valor":         "Valor (R$)",
     }).copy()
     df_tab["Valor (R$)"] = df_tab["Valor (R$)"].apply(_brl)
-    df_tab = df_tab.sort_values("Nº do Processo")
+    df_tab = df_tab.sort_values("Nº da Pasta")
 
     st.dataframe(
         df_tab,
