@@ -213,7 +213,8 @@ _ESCALA_DIVERGENTE = [
 _PREFIXO_ASSUNTO = "Sistema Remuneratório: Verbas - "
 
 _COLUNAS_TABELA = {
-    "processo":             "Nº do Processo",
+    "pasta":                "Nº da Pasta",
+    "processos_vinculados": "Processos Vinculados",
     "valor":                "Valor (R$)",
     "assunto_label":        "Assunto",
     "procurador":           "Procurador",
@@ -299,10 +300,10 @@ _MAPA_COLUNAS_DEMANDAS: dict[str, str] = {
 }
 
 # ── Schema DDL ────────────────────────────────────────────────────────────
-_DDL_PROCESSOS = """
-CREATE TABLE IF NOT EXISTS processos_consolidados (
-    processo                    TEXT PRIMARY KEY,
-    pasta                       TEXT,
+_DDL_PASTAS = """
+CREATE TABLE IF NOT EXISTS pastas_consolidadas (
+    pasta                       TEXT PRIMARY KEY,
+    processos_vinculados        TEXT,
     valor                       REAL,
     ajuizamento                 TEXT,
     cadastro                    TEXT,
@@ -343,9 +344,9 @@ CREATE TABLE IF NOT EXISTS processos_consolidados (
 _DDL_DEMANDAS = """
 CREATE TABLE IF NOT EXISTS demandas (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    processo_base   TEXT NOT NULL,
+    pasta           TEXT NOT NULL,
     processo_orig   TEXT,
-    pasta           TEXT,
+    processo_base   TEXT,
     unidade         TEXT,
     procurador      TEXT,
     demanda         TEXT,
@@ -375,7 +376,7 @@ CREATE TABLE IF NOT EXISTS controle_uploads (
 """
 
 _COLUNAS_SCHEMA_DB = (
-    "processo", "pasta", "valor", "ajuizamento", "cadastro", "classe",
+    "pasta", "processos_vinculados", "valor", "ajuizamento", "cadastro", "classe",
     "materia", "assuntos", "tribunal", "unidade_judicial", "vara",
     "polo_pge", "qualificacao", "parte_representada", "documento_parte_rep",
     "parte_contraria", "documento", "outras_partes_ativas",
@@ -388,6 +389,7 @@ _COLUNAS_SCHEMA_DB = (
 
 # status_exito não atualizado pelo UPSERT do Arquivo A; é derivado do Arquivo B
 _COLUNAS_ATUALIZAVEIS = (
+    "processos_vinculados",
     "valor",
     "tramitacao",
     "situacao",
@@ -396,7 +398,7 @@ _COLUNAS_ATUALIZAVEIS = (
 )
 
 _COLUNAS_DEMANDAS_DB = (
-    "processo_base", "processo_orig", "pasta", "unidade", "procurador",
+    "pasta", "processo_orig", "processo_base", "unidade", "procurador",
     "demanda", "qualificacao", "materia", "assuntos", "tribunal",
     "origem", "status_demanda", "entrada", "conclusao", "horas",
     "publicou", "nucleo", "data_upload",
@@ -413,22 +415,24 @@ _REGRAS_EXITO: list[tuple[str, str]] = [
 # =============================================================================
 
 def _migrar_banco() -> None:
-    """Migração não-destrutiva: adiciona colunas novas e cria tabela demandas."""
+    """Migração não-destrutiva: cria tabelas e adiciona colunas novas."""
     if not _db.db_exists():
         return
     con = _db.connect()
     try:
         cur = con.cursor()
+        cur.execute(_DDL_PASTAS)
+        cur.execute(_DDL_DEMANDAS)
+        cur.execute(_DDL_CONTROLE)
         for col, tipo in [
+            ("processos_vinculados", "TEXT"),
             ("nucleo",               "TEXT"),
             ("procurador",           "TEXT"),
             ("ult_demanda",          "TEXT"),
             ("data_ultima_demanda",  "TEXT"),
             ("total_horas",          "REAL"),
         ]:
-            _db.add_column_if_not_exists(cur, "processos_consolidados", col, tipo)
-        cur.execute(_db.adapt_sql(_DDL_DEMANDAS))
-        cur.execute(_db.adapt_sql(_DDL_CONTROLE))
+            _db.add_column_if_not_exists(cur, "pastas_consolidadas", col, tipo)
         _db.add_column_if_not_exists(cur, "controle_uploads", "nucleo", "TEXT")
         con.commit()
     finally:
@@ -583,7 +587,7 @@ def processar_upload(
     e deriva campos cruzados. Retorna (qtd_processos, qtd_demandas).
     """
 
-    # ── 1. Arquivo A — Processos ───────────────────────────────────────────
+    # ── 1. Arquivo A — Processos (agrupado por Pasta) ──────────────────────
     df = _ler_csv_upload(arquivo_processos.read())
 
     colunas_validas = [
@@ -610,13 +614,24 @@ def processar_upload(
         .pipe(pd.to_numeric, errors="coerce")
     )
 
+    if "pasta" not in df.columns:
+        raise KeyError("Coluna 'Pasta' não encontrada no arquivo de processos.")
     if "processo" not in df.columns:
         raise KeyError("Coluna 'Processo' não encontrada no arquivo de processos.")
+
+    df["pasta"]    = df["pasta"].str.strip()
     df["processo"] = df["processo"].str.strip()
-    colunas_cat = [c for c in df.columns if c not in ("processo", "valor")]
-    agg: dict = {"valor": "sum"}
-    agg.update({c: "first" for c in colunas_cat})
-    df = df.groupby("processo", as_index=False, sort=False).agg(agg)
+
+    colunas_excluir = {"pasta", "processo", "valor", "ajuizamento"}
+    colunas_first   = [c for c in df.columns if c not in colunas_excluir]
+    agg: dict = {
+        "processo":    lambda s: ", ".join(sorted(s.dropna().astype(str).unique())),
+        "valor":       "max",
+        "ajuizamento": "min",
+    }
+    agg.update({c: "first" for c in colunas_first})
+    df = df.groupby("pasta", as_index=False, sort=False).agg(agg)
+    df = df.rename(columns={"processo": "processos_vinculados"})
 
     df["nucleo"] = nome_nucleo
     df["status_exito"] = "Em Andamento"
@@ -627,23 +642,6 @@ def processar_upload(
             df[col] = df[col].dt.strftime("%Y-%m-%d")
 
     df = df.where(pd.notnull(df), other=None)
-
-    colunas_banco = [c for c in _COLUNAS_SCHEMA_DB if c in df.columns]
-    df_banco = df[colunas_banco]
-    cols_str   = ", ".join(colunas_banco)
-    placeh_str = ", ".join([_db.ph()] * len(colunas_banco))
-    atualizacoes = ", ".join(
-        f"{c} = excluded.{c}"
-        for c in _COLUNAS_ATUALIZAVEIS
-        if c in colunas_banco
-    )
-    sql_upsert = f"""
-        INSERT INTO processos_consolidados ({cols_str})
-        VALUES ({placeh_str})
-        ON CONFLICT(processo) DO UPDATE SET
-            {atualizacoes}
-    """
-    registros_proc = [tuple(row) for row in df_banco.itertuples(index=False, name=None)]
 
     # ── 2. Arquivo B — Demandas ────────────────────────────────────────────
     df_dem = _ler_csv_upload(arquivo_demandas.read())
@@ -658,8 +656,11 @@ def processar_upload(
 
     if "processo_orig" not in df_dem.columns:
         raise KeyError("Coluna 'Processo' não encontrada no arquivo de demandas.")
+    if "pasta" not in df_dem.columns:
+        raise KeyError("Coluna 'Pasta' não encontrada no arquivo de demandas.")
 
     df_dem["processo_orig"] = df_dem["processo_orig"].str.strip()
+    df_dem["pasta"]         = df_dem["pasta"].str.strip()
     df_dem["processo_base"] = df_dem["processo_orig"].str.split("/").str[0]
 
     for col in ("entrada", "conclusao"):
@@ -678,18 +679,17 @@ def processar_upload(
     ts = datetime.now().isoformat(timespec="seconds")
     df_dem["data_upload"] = ts
 
-    # ── 3. Derivação cruzada ───────────────────────────────────────────────
-    df_sorted = df_dem.sort_values("conclusao", ascending=False, na_position="last")
-
-    mais_recente = df_sorted.groupby("processo_base", sort=False).first().reset_index()
+    # ── 3. Derivação cruzada (agrupada por Pasta) ──────────────────────────
+    df_sorted    = df_dem.sort_values("conclusao", ascending=False, na_position="last")
+    mais_recente = df_sorted.groupby("pasta", sort=False).first().reset_index()
 
     if "horas" in df_dem.columns:
         total_horas = (
-            df_dem.groupby("processo_base")["horas"]
+            df_dem.groupby("pasta")["horas"]
             .sum().reset_index(name="total_horas")
         )
     else:
-        total_horas = pd.DataFrame(columns=["processo_base", "total_horas"])
+        total_horas = pd.DataFrame(columns=["pasta", "total_horas"])
 
     def _classif_exito_serie(series_list: list) -> str:
         for dem in series_list:
@@ -700,28 +700,25 @@ def processar_upload(
                     return status
         return "Em Andamento"
 
-    status_por_proc = (
-        df_sorted.groupby("processo_base", sort=False)["demanda"]
+    status_por_pasta = (
+        df_sorted.groupby("pasta", sort=False)["demanda"]
         .apply(lambda s: _classif_exito_serie(s.tolist()))
         .reset_index(name="status_exito")
-    ) if "demanda" in df_sorted.columns else pd.DataFrame(
-        columns=["processo_base", "status_exito"]
-    )
+    ) if "demanda" in df_sorted.columns else pd.DataFrame(columns=["pasta", "status_exito"])
 
-    df_deriv = mais_recente[["processo_base"]].copy()
+    df_deriv = mais_recente[["pasta"]].copy()
     df_deriv["ult_demanda"] = (
         mais_recente["demanda"].values if "demanda" in mais_recente.columns else None
     )
     df_deriv["data_ultima_demanda"] = (
         mais_recente["conclusao"].dt.strftime("%Y-%m-%d").values
-        if "conclusao" in mais_recente.columns
-        else None
+        if "conclusao" in mais_recente.columns else None
     )
     df_deriv["procurador"] = (
         mais_recente["procurador"].values if "procurador" in mais_recente.columns else None
     )
-    df_deriv = df_deriv.merge(total_horas, on="processo_base", how="left")
-    df_deriv = df_deriv.merge(status_por_proc, on="processo_base", how="left")
+    df_deriv = df_deriv.merge(total_horas,     on="pasta", how="left")
+    df_deriv = df_deriv.merge(status_por_pasta, on="pasta", how="left")
     df_deriv["total_horas"]  = df_deriv.get("total_horas",  pd.Series(dtype=float)).fillna(0.0)
     df_deriv["status_exito"] = df_deriv.get("status_exito", pd.Series(dtype=str)).fillna("Em Andamento")
     df_deriv = df_deriv.where(pd.notnull(df_deriv), other=None)
@@ -734,7 +731,7 @@ def processar_upload(
             row.get("total_horas"),
             row["status_exito"],
             ts,
-            row["processo_base"],
+            row["pasta"],
         )
         for _, row in df_deriv.iterrows()
     ]
@@ -745,42 +742,75 @@ def processar_upload(
             df_dem[col] = df_dem[col].dt.strftime("%Y-%m-%d")
 
     df_dem = df_dem.where(pd.notnull(df_dem), other=None)
-    cols_dem   = [c for c in _COLUNAS_DEMANDAS_DB if c in df_dem.columns]
-    df_dem_db  = df_dem[cols_dem]
-    placeh_dem = ", ".join([_db.ph()] * len(cols_dem))
-    cols_dem_str = ", ".join(cols_dem)
-    sql_insert_dem = f"INSERT INTO demandas ({cols_dem_str}) VALUES ({placeh_dem})"
-    registros_dem = [tuple(row) for row in df_dem_db.itertuples(index=False, name=None)]
 
     _p = _db.ph()
+    sql_del_dem  = f"DELETE FROM demandas WHERE nucleo = {_p}"
+    sql_ins_ctrl = (
+        f"INSERT INTO controle_uploads "
+        f"(data_upload, nome_arquivo, quantidade_registros_processados, nucleo) "
+        f"VALUES ({_p}, {_p}, {_p}, {_p})"
+    )
     sql_update_deriv = (
-        f"UPDATE processos_consolidados "
+        f"UPDATE pastas_consolidadas "
         f"SET procurador = {_p}, ult_demanda = {_p}, data_ultima_demanda = {_p}, "
         f"    total_horas = {_p}, status_exito = {_p}, data_ultima_atualizacao = {_p} "
-        f"WHERE processo = {_p}"
-    )
-    sql_del_dem      = _db.adapt_sql("DELETE FROM demandas WHERE nucleo = ?")
-    sql_ins_ctrl     = _db.adapt_sql(
-        "INSERT INTO controle_uploads "
-        "(data_upload, nome_arquivo, quantidade_registros_processados, nucleo) VALUES (?, ?, ?, ?)"
+        f"WHERE pasta = {_p}"
     )
 
     # ── 5. Persistir no banco (transação única) ────────────────────────────
     con = _db.connect()
     try:
         cur = con.cursor()
-        cur.execute(_db.adapt_sql(_DDL_PROCESSOS))
-        cur.execute(_db.adapt_sql(_DDL_DEMANDAS))
-        cur.execute(_db.adapt_sql(_DDL_CONTROLE))
+        cur.execute(_DDL_PASTAS)
+        cur.execute(_DDL_DEMANDAS)
+        cur.execute(_DDL_CONTROLE)
         for col, tipo in [
-            ("nucleo",              "TEXT"),
-            ("procurador",          "TEXT"),
-            ("ult_demanda",         "TEXT"),
-            ("data_ultima_demanda", "TEXT"),
-            ("total_horas",         "REAL"),
+            ("processos_vinculados", "TEXT"),
+            ("nucleo",               "TEXT"),
+            ("procurador",           "TEXT"),
+            ("ult_demanda",          "TEXT"),
+            ("data_ultima_demanda",  "TEXT"),
+            ("total_horas",          "REAL"),
         ]:
-            _db.add_column_if_not_exists(cur, "processos_consolidados", col, tipo)
+            _db.add_column_if_not_exists(cur, "pastas_consolidadas", col, tipo)
         _db.add_column_if_not_exists(cur, "controle_uploads", "nucleo", "TEXT")
+
+        # Mescla processos_vinculados com os já persistidos
+        try:
+            existentes = _db.read_sql(
+                "SELECT pasta, processos_vinculados FROM pastas_consolidadas", con
+            )
+            mapa_existente = dict(zip(existentes["pasta"], existentes["processos_vinculados"].fillna("")))
+        except Exception:
+            mapa_existente = {}
+
+        def _merge_procs(row) -> str:
+            novos   = {p.strip() for p in str(row.get("processos_vinculados") or "").split(",") if p.strip()}
+            antigos = {p.strip() for p in str(mapa_existente.get(row["pasta"], "")).split(",")  if p.strip()}
+            return ", ".join(sorted(novos | antigos))
+
+        df["processos_vinculados"] = df.apply(_merge_procs, axis=1)
+
+        colunas_banco = [c for c in _COLUNAS_SCHEMA_DB if c in df.columns]
+        df_banco = df[colunas_banco]
+        cols_str    = ", ".join(colunas_banco)
+        placeh_str  = ", ".join([_p] * len(colunas_banco))
+        atualizacoes = ", ".join(
+            f"{c} = excluded.{c}" for c in _COLUNAS_ATUALIZAVEIS if c in colunas_banco
+        )
+        sql_upsert = (
+            f"INSERT INTO pastas_consolidadas ({cols_str}) "
+            f"VALUES ({placeh_str}) "
+            f"ON CONFLICT(pasta) DO UPDATE SET {atualizacoes}"
+        )
+        registros_proc = [tuple(row) for row in df_banco.itertuples(index=False, name=None)]
+
+        cols_dem    = [c for c in _COLUNAS_DEMANDAS_DB if c in df_dem.columns]
+        df_dem_db   = df_dem[cols_dem]
+        placeh_dem  = ", ".join([_p] * len(cols_dem))
+        cols_dem_str = ", ".join(cols_dem)
+        sql_insert_dem = f"INSERT INTO demandas ({cols_dem_str}) VALUES ({placeh_dem})"
+        registros_dem = [tuple(row) for row in df_dem_db.itertuples(index=False, name=None)]
 
         _db.executemany(cur, sql_upsert, registros_proc)
         cur.execute(sql_del_dem, (nome_nucleo,))
@@ -808,7 +838,7 @@ def _nucleos_carregados() -> list[str]:
     try:
         con = _db.connect()
         df = _db.read_sql(
-            "SELECT DISTINCT nucleo FROM processos_consolidados "
+            "SELECT DISTINCT nucleo FROM pastas_consolidadas "
             "WHERE nucleo IS NOT NULL AND nucleo <> ''",
             con,
         )
@@ -819,14 +849,14 @@ def _nucleos_carregados() -> list[str]:
 
 
 def _resumo_geral() -> dict:
-    """Conta processos, demandas e uploads no banco, independente de núcleo estar marcado."""
+    """Conta pastas, demandas e uploads no banco, independente de núcleo estar marcado."""
     resumo = {"processos": 0, "demandas": 0, "uploads": 0}
     if not _db.db_exists():
         return resumo
     try:
         con = _db.connect()
         cur = con.cursor()
-        cur.execute("SELECT COUNT(*) FROM processos_consolidados")
+        cur.execute("SELECT COUNT(*) FROM pastas_consolidadas")
         resumo["processos"] = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM demandas")
         resumo["demandas"] = cur.fetchone()[0]
@@ -839,7 +869,7 @@ def _resumo_geral() -> dict:
 
 
 def _resumo_nucleo(nucleo: str) -> dict:
-    """Conta processos, demandas e uploads registrados para um núcleo."""
+    """Conta pastas, demandas e uploads registrados para um núcleo."""
     resumo = {"processos": 0, "demandas": 0, "uploads": 0}
     if not _db.db_exists():
         return resumo
@@ -847,7 +877,7 @@ def _resumo_nucleo(nucleo: str) -> dict:
         con = _db.connect()
         cur = con.cursor()
         ph = _db.ph()
-        cur.execute(f"SELECT COUNT(*) FROM processos_consolidados WHERE nucleo = {ph}", (nucleo,))
+        cur.execute(f"SELECT COUNT(*) FROM pastas_consolidadas WHERE nucleo = {ph}", (nucleo,))
         resumo["processos"] = cur.fetchone()[0]
         cur.execute(f"SELECT COUNT(*) FROM demandas WHERE nucleo = {ph}", (nucleo,))
         resumo["demandas"] = cur.fetchone()[0]
@@ -861,7 +891,7 @@ def _resumo_nucleo(nucleo: str) -> dict:
 
 def excluir_dados_nucleo(nucleo: str) -> dict:
     """
-    Exclui permanentemente todos os processos, demandas e registros de upload
+    Exclui permanentemente todas as pastas, demandas e registros de upload
     associados a um núcleo. Operação destrutiva e irreversível.
     Retorna dict com a contagem de linhas excluídas por tabela.
     """
@@ -869,14 +899,14 @@ def excluir_dados_nucleo(nucleo: str) -> dict:
     con = _db.connect()
     try:
         cur = con.cursor()
-        cur.execute(f"SELECT COUNT(*) FROM processos_consolidados WHERE nucleo = {ph}", (nucleo,))
+        cur.execute(f"SELECT COUNT(*) FROM pastas_consolidadas WHERE nucleo = {ph}", (nucleo,))
         n_proc = cur.fetchone()[0]
         cur.execute(f"SELECT COUNT(*) FROM demandas WHERE nucleo = {ph}", (nucleo,))
         n_dem = cur.fetchone()[0]
         cur.execute(f"SELECT COUNT(*) FROM controle_uploads WHERE nucleo = {ph}", (nucleo,))
         n_ctrl = cur.fetchone()[0]
 
-        cur.execute(f"DELETE FROM processos_consolidados WHERE nucleo = {ph}", (nucleo,))
+        cur.execute(f"DELETE FROM pastas_consolidadas WHERE nucleo = {ph}", (nucleo,))
         cur.execute(f"DELETE FROM demandas WHERE nucleo = {ph}", (nucleo,))
         cur.execute(f"DELETE FROM controle_uploads WHERE nucleo = {ph}", (nucleo,))
         con.commit()
@@ -891,21 +921,21 @@ def excluir_dados_nucleo(nucleo: str) -> dict:
 
 def excluir_todos_dados() -> dict:
     """
-    Reset total: exclui permanentemente TODOS os processos, demandas e
+    Reset total: exclui permanentemente TODAS as pastas, demandas e
     registros de upload de TODOS os núcleos. Operação destrutiva e irreversível.
     Retorna dict com a contagem de linhas excluídas por tabela.
     """
     con = _db.connect()
     try:
         cur = con.cursor()
-        cur.execute("SELECT COUNT(*) FROM processos_consolidados")
+        cur.execute("SELECT COUNT(*) FROM pastas_consolidadas")
         n_proc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM demandas")
         n_dem = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM controle_uploads")
         n_ctrl = cur.fetchone()[0]
 
-        cur.execute("DELETE FROM processos_consolidados")
+        cur.execute("DELETE FROM pastas_consolidadas")
         cur.execute("DELETE FROM demandas")
         cur.execute("DELETE FROM controle_uploads")
         con.commit()
@@ -921,16 +951,16 @@ def excluir_todos_dados() -> dict:
 # CARREGAMENTO DE DADOS
 # =============================================================================
 
-@st.cache_data(ttl=300, show_spinner="⏳ Carregando base de processos...")
+@st.cache_data(ttl=300, show_spinner="⏳ Carregando base de pastas...")
 def _carregar_df() -> pd.DataFrame:
     con = _db.connect()
     df  = _db.read_sql(
         """
-        SELECT processo, valor, ajuizamento, assuntos, tribunal,
+        SELECT pasta, processos_vinculados, valor, ajuizamento, assuntos, tribunal,
                unidade_judicial, vara, situacao, unidade, mesa,
                status_exito, nucleo,
                procurador, ult_demanda, data_ultima_demanda, total_horas
-        FROM   processos_consolidados
+        FROM   pastas_consolidadas
         """,
         con,
     )
@@ -972,7 +1002,7 @@ def _carregar_demandas() -> pd.DataFrame:
     try:
         con = _db.connect()
         df = _db.read_sql(
-            """SELECT processo_base, processo_orig, procurador, demanda,
+            """SELECT pasta, processo_orig, processo_base, procurador, demanda,
                       unidade, origem, status_demanda,
                       entrada, conclusao, horas, publicou, nucleo
                FROM demandas""",
@@ -1233,7 +1263,7 @@ def _donut(df: pd.DataFrame) -> None:
         annotations=[dict(
             text=(
                 f"<span style='font-size:26px;font-weight:900;color:#212529'>{len(df):,}</span><br>"
-                f"<span style='font-size:11px;font-weight:600;letter-spacing:1px;color:#6C757D'>PROCESSOS</span>"
+                f"<span style='font-size:11px;font-weight:600;letter-spacing:1px;color:#6C757D'>PASTAS</span>"
             ).replace(",", "."),
             x=0.5, y=0.5, showarrow=False,
         )],
@@ -1408,7 +1438,7 @@ def _subtab_f1_panorama(df: pd.DataFrame) -> None:
     c1, c2, c3, c4 = st.columns(4, gap="small")
     with c1:
         st.metric(
-            "Total de Processos",
+            "Total de Pastas (Litígios)",
             f"{kpi['total']:,}".replace(",", "."),
             delta=f"{kpi['vitorias']}V · {kpi['perdas']}P · {kpi['decididos']} decididos",
             delta_color="off",
@@ -1618,7 +1648,7 @@ def _subtab_f1_detalhamento(df: pd.DataFrame) -> None:
         st.warning("Nenhum processo corresponde à seleção. Ajuste os filtros.", icon="⚠️")
         return
 
-    st.markdown('<p class="sec-title">Detalhamento de Processos</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec-title">Detalhamento de Pastas</p>', unsafe_allow_html=True)
 
     cols_disp = [c for c in _COLUNAS_TABELA if c in df.columns]
     df_tab = df[cols_disp].rename(columns=_COLUNAS_TABELA).copy()
@@ -1742,7 +1772,7 @@ def _subtab_f1_linha_tempo(df: pd.DataFrame) -> None:
         )
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
-    st.markdown('<p class="sec-title">Processos do Período Selecionado</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec-title">Pastas do Período Selecionado</p>', unsafe_allow_html=True)
 
     cols_disp = [c for c in _COLUNAS_TABELA if c in detalhe.columns]
     df_tab = detalhe[cols_disp].rename(columns=_COLUNAS_TABELA).copy()
@@ -1811,18 +1841,17 @@ def _subtab_f1_estagio(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
         )
         return
 
-    # Classificar cada processo_base pelo seu estágio mais avançado
+    # Classificar cada pasta pelo seu estágio mais avançado
     estagio_map = (
-        df_dem_full.groupby("processo_base")["demanda"]
+        df_dem_full.groupby("pasta")["demanda"]
         .apply(_classif_estagio)
         .reset_index(name="Estágio")
     )
 
-    # Cruzar com processos filtrados (df usa "processo" como PK)
+    # Cruzar com pastas filtradas (df usa "pasta" como PK)
     df_est = df.merge(
         estagio_map,
-        left_on="processo",
-        right_on="processo_base",
+        on="pasta",
         how="left",
     )
     df_est["Estágio"] = df_est["Estágio"].fillna("Fase Inicial / Conhecimento")
@@ -1855,7 +1884,7 @@ def _subtab_f1_estagio(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
 
     agg_chart = (
         df_est.groupby("Estágio")
-        .agg(valor_total=("valor", "sum"), processos=("processo", "nunique"))
+        .agg(valor_total=("valor", "sum"), pastas=("pasta", "nunique"))
         .reindex(_ESTAGIOS_ORDEM, fill_value=0)
         .reset_index()
     )
@@ -1880,7 +1909,7 @@ def _subtab_f1_estagio(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
         hovertemplate=(
             "<b>%{x}</b><br>"
             "Volume: R$ %{y:,.2f}<br>"
-            "Processos: %{customdata[0]}"
+            "Pastas: %{customdata[0]}"
             "<extra></extra>"
         ),
     )
@@ -1916,10 +1945,10 @@ def _subtab_f1_estagio(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
 
     df_estagio_tab = df_est[df_est["Estágio"] == estagio_sel].copy()
 
-    cols_show = [c for c in ["processo", "procurador", "assunto_label", "ult_demanda", "valor"]
+    cols_show = [c for c in ["pasta", "procurador", "assunto_label", "ult_demanda", "valor"]
                  if c in df_estagio_tab.columns]
     df_tab = df_estagio_tab[cols_show].rename(columns={
-        "processo":      "Nº do Processo",
+        "pasta":         "Nº da Pasta",
         "procurador":    "Procurador",
         "assunto_label": "Assunto",
         "ult_demanda":   "Última Demanda",
@@ -1934,7 +1963,7 @@ def _subtab_f1_estagio(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
         hide_index=True,
         height=420,
         column_config={
-            "Nº do Processo": st.column_config.TextColumn(width="medium"),
+            "Nº da Pasta":    st.column_config.TextColumn(width="medium"),
             "Procurador":     st.column_config.TextColumn(width="medium"),
             "Assunto":        st.column_config.TextColumn(width="large"),
             "Última Demanda": st.column_config.TextColumn(width="large"),
@@ -1942,7 +1971,7 @@ def _subtab_f1_estagio(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
         },
     )
     st.markdown(
-        f"<small style='color:#ADB5BD'>{len(df_tab):,} processos em «{estagio_sel}»</small>".replace(",", "."),
+        f"<small style='color:#ADB5BD'>{len(df_tab):,} pastas em «{estagio_sel}»</small>".replace(",", "."),
         unsafe_allow_html=True,
     )
 
@@ -2094,7 +2123,7 @@ def _subtab_f2_nucleos(df: pd.DataFrame, df_dem: pd.DataFrame) -> None:
             Demandas=("demanda", "count"),
             Horas_Total=("horas", "sum"),
             Horas_Medias=("horas", "mean"),
-            Processos_Unicos=("processo_base", "nunique"),
+            Processos_Unicos=("pasta", "nunique"),
             Procuradores_Unicos=("procurador", "nunique"),
         )
         .reset_index()
@@ -2115,7 +2144,7 @@ def _subtab_f2_nucleos(df: pd.DataFrame, df_dem: pd.DataFrame) -> None:
             df[df["status_exito"] == "Em Andamento"]
             .groupby("nucleo")
             .agg(
-                Processos_Ativos=("processo", "nunique"),
+                Processos_Ativos=("pasta", "nunique"),
                 Valor_Conducao=("valor", "sum"),
             )
             .reset_index()
@@ -2381,7 +2410,7 @@ def _subtab_f2_gargalos(df_dem: pd.DataFrame) -> None:
     with kc1:
         st.metric("Demandas Pendentes", f"{len(pendentes):,}".replace(",", "."))
     with kc2:
-        st.metric("Processos Afetados", f"{pendentes['processo_base'].nunique():,}".replace(",", "."))
+        st.metric("Pastas Afetadas", f"{pendentes['pasta'].nunique():,}".replace(",", "."))
     with kc3:
         st.metric("Procuradores com Pendências", f"{pendentes['procurador'].nunique():,}".replace(",", "."))
 
@@ -2417,20 +2446,20 @@ def _subtab_f2_gargalos(df_dem: pd.DataFrame) -> None:
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
     st.markdown('<p class="sec-title">Lista de Demandas Pendentes</p>', unsafe_allow_html=True)
 
-    cols_pend = [c for c in ["processo_base", "procurador", "demanda", "entrada", "horas", "origem"]
+    cols_pend = [c for c in ["pasta", "procurador", "demanda", "entrada", "horas", "origem"]
                  if c in pendentes.columns]
     pend_tab = pendentes[cols_pend].copy()
     if "entrada" in pend_tab.columns:
         pend_tab["entrada"] = pend_tab["entrada"].dt.strftime("%d/%m/%Y").fillna("—")
     pend_tab = pend_tab.rename(columns={
-        "processo_base": "Processo", "procurador": "Procurador",
+        "pasta": "Pasta", "procurador": "Procurador",
         "demanda": "Demanda", "entrada": "Entrada", "horas": "Horas", "origem": "Origem",
     }).sort_values("Horas", ascending=False)
 
     st.dataframe(
         pend_tab, use_container_width=True, hide_index=True, height=400,
         column_config={
-            "Processo":   st.column_config.TextColumn(width="medium"),
+            "Pasta":      st.column_config.TextColumn(width="medium"),
             "Procurador": st.column_config.TextColumn(width="medium"),
             "Demanda":    st.column_config.TextColumn(width="large"),
             "Entrada":    st.column_config.TextColumn(width="small"),
@@ -2504,29 +2533,29 @@ def _subtab_f2_timeline(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
         )
         return
 
-    st.markdown('<p class="sec-title">Histórico de Demandas por Processo</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec-title">Histórico de Demandas por Pasta</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sec-sub">Selecione um processo para visualizar sua linha do tempo de demandas.</p>',
+        '<p class="sec-sub">Selecione uma pasta para visualizar sua linha do tempo de demandas.</p>',
         unsafe_allow_html=True,
     )
 
-    processos_opcoes = sorted(df["processo"].dropna().tolist())
+    pastas_opcoes = sorted(df["pasta"].dropna().tolist())
     proc_sel = st.selectbox(
-        "Processo",
-        options=processos_opcoes,
+        "Pasta",
+        options=pastas_opcoes,
         key="andamento_proc_sel",
         label_visibility="collapsed",
     )
 
     if proc_sel:
-        hist = df_dem_full[df_dem_full["processo_base"] == proc_sel].copy()
+        hist = df_dem_full[df_dem_full["pasta"] == proc_sel].copy()
         hist = hist.sort_values("conclusao", ascending=False, na_position="last")
 
         if hist.empty:
-            st.info(f"Nenhuma demanda registrada para o processo **{proc_sel}**.", icon="ℹ️")
+            st.info(f"Nenhuma demanda registrada para a pasta **{proc_sel}**.", icon="ℹ️")
             return
 
-        proc_info = df[df["processo"] == proc_sel]
+        proc_info = df[df["pasta"] == proc_sel]
         if not proc_info.empty:
             pi = proc_info.iloc[0]
             c1, c2, c3, c4 = st.columns(4, gap="small")
@@ -2933,7 +2962,7 @@ def _build_mapa_frente1(df: pd.DataFrame, filtros_sidebar: dict) -> dict:
         teses_df = (
             df.groupby("assunto_label")
             .agg(
-                total    = ("processo",      "count"),
+                total    = ("pasta",         "count"),
                 vitorias = ("status_exito",  lambda x: (x == "Vitória").sum()),
                 perdas   = ("status_exito",  lambda x: (x == "Perda").sum()),
                 valor    = ("valor",         "sum"),
@@ -2968,7 +2997,7 @@ def _build_mapa_frente1(df: pd.DataFrame, filtros_sidebar: dict) -> dict:
         com_df = (
             df.groupby("comarca_limpa")
             .agg(
-                total    = ("processo",     "count"),
+                total    = ("pasta",        "count"),
                 vitorias = ("status_exito", lambda x: (x == "Vitória").sum()),
                 perdas   = ("status_exito", lambda x: (x == "Perda").sum()),
                 valor    = ("valor",        "sum"),
@@ -3000,7 +3029,7 @@ def _build_mapa_frente1(df: pd.DataFrame, filtros_sidebar: dict) -> dict:
         tempo_df = (
             tmp.groupby("mes")
             .agg(
-                novos    = ("processo",     "count"),
+                novos    = ("pasta",        "count"),
                 decididos= ("status_exito", lambda x: ((x=="Vitória")|(x=="Perda")).sum()),
                 vitorias = ("status_exito", lambda x: (x=="Vitória").sum()),
                 perdas   = ("status_exito", lambda x: (x=="Perda").sum()),
@@ -3126,7 +3155,7 @@ def _build_mapa_frente1(df: pd.DataFrame, filtros_sidebar: dict) -> dict:
     # Detalhamento 1–10
     for i in range(10):
         n = i + 1
-        mapa[f"{{{{PROC_{n}}}}}"]   = _d(i, "processo")
+        mapa[f"{{{{PROC_{n}}}}}"]   = _d(i, "pasta")
         mapa[f"{{{{DAJ_{n}}}}}"]    = _d_date(i, "ajuizamento")
         mapa[f"{{{{TESE_D_{n}}}}}"] = _d(i, "assunto_label")
         mapa[f"{{{{COM_{n}}}}}"]    = _d(i, "comarca_limpa")
@@ -3390,7 +3419,7 @@ def _build_mapa_frente2(df_dem: pd.DataFrame, filtros_sidebar: dict) -> dict:
     # Gargalos 1–10
     for i in range(10):
         n = i + 1
-        mapa[f"{{{{GARG{n}_PROC}}}}"] = _g(i, "processo_base")
+        mapa[f"{{{{GARG{n}_PROC}}}}"] = _g(i, "pasta")
         mapa[f"{{{{GARG{n}_PCR}}}}"]  = _g(i, "procurador")
         mapa[f"{{{{GARG{n}_TIPO}}}}"] = _g(i, "demanda")
         mapa[f"{{{{GARG{n}_ENT}}}}"]  = _g(i, "entrada", "date")
@@ -3501,9 +3530,9 @@ def main() -> None:
         subtitulo = "Coordenadoria do Contencioso Geral"
 
     badge = (
-        f"🔍 {len(df):,} de {len(df_full):,} processos".replace(",", ".")
+        f"🔍 {len(df):,} de {len(df_full):,} pastas".replace(",", ".")
         if len(df) < len(df_full)
-        else f"📋 Base completa · {len(df_full):,} processos".replace(",", ".")
+        else f"📋 Base completa · {len(df_full):,} pastas".replace(",", ".")
     )
     st.markdown(
         f"""
