@@ -1897,7 +1897,7 @@ def _subtab_f1_estagio(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
         color="Estágio",
         color_discrete_map=_ESTAGIOS_CORES,
         text="valor_total",
-        custom_data=["processos"],
+        custom_data=["pastas"],
         category_orders={"Estágio": _ESTAGIOS_ORDEM},
     )
     fig.update_traces(
