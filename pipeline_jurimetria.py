@@ -151,10 +151,12 @@ def _converter_valor_financeiro(df: pd.DataFrame) -> pd.DataFrame:
         raise KeyError("Coluna 'valor' não encontrada no arquivo de processos.")
     df["valor"] = (
         df["valor"]
+        .astype(str)
         .str.strip()
         .str.replace(".", "", regex=False)
         .str.replace(",", ".", regex=False)
         .pipe(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
     )
     return df
 
