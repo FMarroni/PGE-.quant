@@ -28,7 +28,9 @@ def executemany(cur: sqlite3.Cursor, sql: str, rows: list[tuple]) -> None:
         cur.executemany(sql, rows)
 
 
-def read_sql(sql: str, con: sqlite3.Connection) -> pd.DataFrame:
+def read_sql(sql: str, con: sqlite3.Connection, params=None) -> pd.DataFrame:
+    if params is not None:
+        return pd.read_sql(sql, con, params=params)
     return pd.read_sql(sql, con)
 
 
