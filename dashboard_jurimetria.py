@@ -467,20 +467,44 @@ def processar_upload(
     nome_nucleo: str,
     competencia: str | None = None,
 ) -> tuple[int, int]:
-    """
-    Wrapper que delega toda a lógica de ingestão ao pipeline centralizado.
-    Retorna (qtd_pastas, qtd_demandas).
-    """
-    arquivo_processos.seek(0)
-    bytes_proc = arquivo_processos.read()
-    arquivo_demandas.seek(0)
-    bytes_dem = arquivo_demandas.read()
-
+    """Wrapper completo (Processos + Demandas). Retorna (qtd_pastas, qtd_demandas)."""
+    arquivo_processos.seek(0); bytes_proc = arquivo_processos.read()
+    arquivo_demandas.seek(0);  bytes_dem  = arquivo_demandas.read()
     return _pipeline.ingerir_upload_bytes(
         bytes_processos=bytes_proc,
         bytes_demandas=bytes_dem,
         nome_arquivo_proc=arquivo_processos.name,
         nome_arquivo_dem=arquivo_demandas.name,
+        nome_nucleo=nome_nucleo,
+        competencia=competencia or None,
+    )
+
+
+def processar_upload_processos(
+    arquivo_processos,
+    nome_nucleo: str,
+    competencia: str | None = None,
+) -> int:
+    """Wrapper somente Processos — atualiza catálogo de pastas. Retorna qtd_pastas."""
+    arquivo_processos.seek(0)
+    return _pipeline.ingerir_somente_processos(
+        bytes_processos=arquivo_processos.read(),
+        nome_arquivo=arquivo_processos.name,
+        nome_nucleo=nome_nucleo,
+        competencia=competencia or None,
+    )
+
+
+def processar_upload_demandas(
+    arquivo_demandas,
+    nome_nucleo: str,
+    competencia: str | None = None,
+) -> int:
+    """Wrapper somente Demandas — registra eventos de resultado. Retorna qtd_demandas."""
+    arquivo_demandas.seek(0)
+    return _pipeline.ingerir_somente_demandas(
+        bytes_demandas=arquivo_demandas.read(),
+        nome_arquivo=arquivo_demandas.name,
         nome_nucleo=nome_nucleo,
         competencia=competencia or None,
     )
@@ -2379,8 +2403,8 @@ def _subtab_f2_timeline(df: pd.DataFrame, df_dem_full: pd.DataFrame) -> None:
 def _tab_upload() -> None:
     st.markdown('<p class="sec-title">Atualização da Base de Dados</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sec-sub">Importe os dois relatórios exportados do sistema de gestão processual. '
-        'O núcleo é identificado automaticamente a partir dos arquivos.</p>',
+        '<p class="sec-sub">Importe um ou ambos os relatórios exportados do sistema de gestão processual. '
+        'O modo de processamento é detectado automaticamente conforme os arquivos enviados.</p>',
         unsafe_allow_html=True,
     )
 
@@ -2406,17 +2430,29 @@ def _tab_upload() -> None:
             help="Arquivo: 'Demandas por unidade e procurador para Excel (Lista) (Mês Ano).txt'",
         )
 
-        ambos_carregados = arquivo_processos is not None and arquivo_demandas is not None
-
-        if not ambos_carregados and (arquivo_processos or arquivo_demandas):
-            faltando = "Demandas" if arquivo_processos else "Processos"
-            st.caption(f"⚠️ Aguardando arquivo de **{faltando}** para habilitar o processamento.")
+        tem_proc = arquivo_processos is not None
+        tem_dem  = arquivo_demandas  is not None
+        algum_carregado  = tem_proc or tem_dem
+        ambos_carregados = tem_proc and tem_dem
+        modo = (
+            "completo"  if ambos_carregados else
+            "processos" if tem_proc          else
+            "demandas"  if tem_dem           else
+            None
+        )
+        _MODO_LABELS = {
+            "completo":  "📦 Modo completo — Processos + Demandas",
+            "processos": "🗂 Modo catálogo — somente Processos",
+            "demandas":  "📋 Modo eventos — somente Demandas",
+        }
+        if modo:
+            st.caption(_MODO_LABELS[modo])
 
         nucleo_detectado = None
-        if ambos_carregados:
+        if algum_carregado:
             nucleo_detectado = (
-                _detectar_nucleo_arquivo(arquivo_processos)
-                or _detectar_nucleo_arquivo(arquivo_demandas)
+                (_detectar_nucleo_arquivo(arquivo_processos) if tem_proc else None)
+                or (_detectar_nucleo_arquivo(arquivo_demandas) if tem_dem else None)
             )
 
         st.markdown("<div style='margin-top:.8rem'>", unsafe_allow_html=True)
@@ -2444,19 +2480,16 @@ def _tab_upload() -> None:
                 nucleo_final = st.selectbox(
                     "Núcleo", options=lista_nucleos, index=idx_padrao, key="upload_nucleo",
                 )
-        elif ambos_carregados:
+        elif algum_carregado:
             st.warning(
-                "Não foi possível identificar o núcleo automaticamente a partir dos arquivos. "
+                "Não foi possível identificar o núcleo automaticamente. "
                 "Selecione manualmente abaixo.",
                 icon="⚠️",
             )
             grupo_sel = st.selectbox("Grupo", options=list(grupo_opts.keys()), key="upload_grupo")
             nucleo_final = st.selectbox("Núcleo", options=grupo_opts[grupo_sel], key="upload_nucleo")
         else:
-            st.caption(
-                "Envie os dois arquivos para identificar o núcleo automaticamente, "
-                "ou selecione manualmente abaixo."
-            )
+            st.caption("Envie ao menos um arquivo para identificar o núcleo automaticamente.")
             grupo_sel = st.selectbox("Grupo", options=list(grupo_opts.keys()), key="upload_grupo")
             nucleo_final = st.selectbox("Núcleo", options=grupo_opts[grupo_sel], key="upload_nucleo")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2466,7 +2499,7 @@ def _tab_upload() -> None:
             "Competência (MM/AAAA)",
             placeholder="Ex: 05/2025 — deixe em branco para detectar automaticamente",
             key="upload_competencia",
-            help="Período de referência dos arquivos. Se omitido, será derivado da data de entrada mais frequente nas demandas.",
+            help="Período de referência. Para Demandas é inferido da data de Entrada se omitido. Para Processos é apenas registro.",
         )
         competencia_val: str | None = competencia_input.strip() or None
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2476,22 +2509,38 @@ def _tab_upload() -> None:
             "⬆️  Processar e Salvar Base",
             type="primary",
             use_container_width=True,
-            disabled=not ambos_carregados,
+            disabled=not algum_carregado,
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
         if processar:
-            with st.spinner(f"Processando base do {nucleo_final}..."):
+            with st.spinner(f"{_MODO_LABELS.get(modo, 'Processando')} — {nucleo_final}..."):
                 try:
-                    qtd_proc, qtd_dem = processar_upload(
-                        arquivo_processos, arquivo_demandas, nucleo_final,
-                        competencia=competencia_val,
-                    )
-                    st.success(
-                        f"**{qtd_proc:,} processos** e **{qtd_dem:,} demandas** salvos "
-                        f"com sucesso para **{nucleo_final}**!".replace(",", "."),
-                        icon="✅",
-                    )
+                    if modo == "completo":
+                        qtd_proc, qtd_dem = processar_upload(
+                            arquivo_processos, arquivo_demandas, nucleo_final,
+                            competencia=competencia_val,
+                        )
+                        msg = (
+                            f"**{qtd_proc:,} pastas** e **{qtd_dem:,} demandas** "
+                            f"salvas para **{nucleo_final}**."
+                        ).replace(",", ".")
+                    elif modo == "processos":
+                        qtd = processar_upload_processos(
+                            arquivo_processos, nucleo_final, competencia=competencia_val,
+                        )
+                        msg = (
+                            f"Catálogo atualizado: **{qtd:,} pastas** "
+                            f"processadas para **{nucleo_final}**."
+                        ).replace(",", ".")
+                    else:
+                        qtd = processar_upload_demandas(
+                            arquivo_demandas, nucleo_final, competencia=competencia_val,
+                        )
+                        msg = (
+                            f"**{qtd:,} demandas** processadas para **{nucleo_final}**."
+                        ).replace(",", ".")
+                    st.success(msg, icon="✅")
                     st.cache_data.clear()
                     st.rerun()
                 except KeyError as e:
@@ -2503,19 +2552,19 @@ def _tab_upload() -> None:
 
     with col_info:
         st.info(
-            "**Formato esperado**\n\n"
-            "**Arquivo 1 — Processos:**\n"
-            "- 'Relatório Detalhado para Excel (Lista)'\n"
-            "- CSV separado por vírgula (`.txt` ou `.csv`)\n\n"
-            "**Arquivo 2 — Demandas:**\n"
-            "- 'Demandas por unidade e procurador para Excel (Lista)'\n"
-            "- CSV separado por vírgula (`.txt` ou `.csv`)\n\n"
-            "**O que acontece ao processar:**\n\n"
-            "- Processos novos são **inseridos**\n"
-            "- Processos existentes têm valor, tramitação e situação **atualizados**\n"
-            "- Demandas da competência + núcleo são **substituídas** (demais períodos preservados)\n"
-            "- Resultado econômico é **recalculado** cruzando demandas históricas com processos\n"
-            "- Status de êxito e procurador são **derivados das demandas**",
+            "**Modos de upload disponíveis**\n\n"
+            "**🗂 Somente Processos**\n"
+            "Atualiza o catálogo de valores, comarcas e varas. "
+            "Ideal para carregar histórico de 2024/2025 antes de importar demandas. "
+            "Não apaga demandas existentes.\n\n"
+            "**📋 Somente Demandas**\n"
+            "Registra eventos de resultado por competência. "
+            "A competência é inferida da data de Entrada se não informada. "
+            "Apaga e reinsere apenas o mês processado (outros períodos preservados).\n\n"
+            "**📦 Processos + Demandas**\n"
+            "Modo completo recomendado para alimentação mensal regular.\n\n"
+            "**Em todos os modos:** o resultado econômico é recalculado cruzando "
+            "todo o histórico de demandas com o catálogo completo de processos do banco.",
             icon="ℹ️",
         )
 
@@ -2529,15 +2578,16 @@ def _tab_upload() -> None:
             try:
                 con = _db.connect()
                 hist = _db.read_sql(
-                    "SELECT data_upload, nome_arquivo, quantidade_registros_processados, nucleo "
+                    "SELECT data_upload, nome_arquivo, quantidade_registros_processados, nucleo, tipo_arquivo "
                     "FROM controle_uploads ORDER BY id DESC LIMIT 10",
                     con,
                 )
                 con.close()
                 if not hist.empty:
-                    hist.columns = ["Data/Hora", "Arquivo", "Registros", "Núcleo"]
+                    hist.columns = ["Data/Hora", "Arquivo", "Registros", "Núcleo", "Tipo"]
                     hist["Data/Hora"] = hist["Data/Hora"].str[:16].str.replace("T", " ")
                     hist["Núcleo"] = hist["Núcleo"].fillna("—")
+                    hist["Tipo"]   = hist["Tipo"].fillna("completo")
                     st.dataframe(hist, use_container_width=True, hide_index=True, height=240)
                 else:
                     st.caption("Nenhum upload registrado ainda.")

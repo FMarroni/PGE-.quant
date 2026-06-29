@@ -312,6 +312,9 @@ HIERARQUIA_RESULTADO: list[str] = [
 # Grupos para exibição / cálculo de KPIs
 RESULTADOS_GANHO  = frozenset({"Ganho definitivo", "Ganho forte", "Ganho provável"})
 RESULTADOS_PERDA  = frozenset({"Perda financeira", "Perda definitiva", "Perda forte", "Perda provável"})
+
+# Ranking de qualidade do match (menor = melhor)
+_NIVEL_MATCH_RANK: dict[str, int] = {"forte": 0, "medio": 1, "fraco": 2, "sem_match": 3}
 RESULTADOS_FINAIS = RESULTADOS_GANHO | RESULTADOS_PERDA
 
 # Cores para o dashboard
@@ -440,9 +443,31 @@ def calcular_resultado_economico(
     # Construir tabelas de valor para lookup
     if not df_proc.empty and "valor" in df_proc.columns and "pasta" in df_proc.columns:
         df_p = df_proc.copy()
-        if "processo_base" not in df_p.columns:
-            col_p = "processo" if "processo" in df_p.columns else None
-            df_p["processo_base"] = df_p[col_p].apply(normalizar_processo_base) if col_p else ""
+
+        # Quando o catálogo vem do banco (pastas_consolidadas), processo está em
+        # processos_vinculados como string CSV; precisamos expandir para obter
+        # (pasta, processo_base) individuais para o match forte.
+        if "processo_base" not in df_p.columns and "processo" not in df_p.columns:
+            if "processos_vinculados" in df_p.columns:
+                linhas_exp = []
+                for _, row in df_p.iterrows():
+                    procs = [p.strip() for p in str(row.get("processos_vinculados") or "").split(",") if p.strip()]
+                    if procs:
+                        for p in procs:
+                            r = row.to_dict()
+                            r["processo_base"] = normalizar_processo_base(p)
+                            linhas_exp.append(r)
+                    else:
+                        r = row.to_dict()
+                        r["processo_base"] = ""
+                        linhas_exp.append(r)
+                df_p = pd.DataFrame(linhas_exp)
+            else:
+                df_p["processo_base"] = ""
+        elif "processo_base" not in df_p.columns:
+            col_p = "processo"
+            df_p["processo_base"] = df_p[col_p].apply(normalizar_processo_base)
+
         vl_combo = df_p.groupby(["pasta", "processo_base"])["valor"].sum().reset_index()
         vl_proc  = df_p.groupby("processo_base")["valor"].sum().reset_index()
         vl_pasta = df_p.groupby("pasta")["valor"].sum().reset_index()
@@ -500,21 +525,28 @@ def calcular_resultado_economico(
     df_pbase = pd.DataFrame(linhas_pbase)
 
     # Consolidar por pasta (uma pasta pode ter múltiplos processo_base)
-    pasta_res  = (df_pbase.groupby("pasta")["resultado"]
-                  .apply(lambda s: min(s.tolist(), key=_forca))
-                  .reset_index(name="resultado"))
-    pasta_val  = df_pbase.groupby("pasta")["valor"].sum().reset_index()
-    pasta_tv   = (df_pbase.groupby("pasta")["tem_valor"].max() > 0).reset_index()
-    pasta_metr = df_pbase.groupby("pasta").agg(
+    pasta_res   = (df_pbase.groupby("pasta")["resultado"]
+                   .apply(lambda s: min(s.tolist(), key=_forca))
+                   .reset_index(name="resultado"))
+    pasta_val   = df_pbase.groupby("pasta")["valor"].sum().reset_index()
+    pasta_tv    = (df_pbase.groupby("pasta")["tem_valor"].max() > 0).reset_index()
+    pasta_metr  = df_pbase.groupby("pasta").agg(
         n_classificados=("n_classificados", "sum"),
         n_transitos_sem_evento=("n_transitos_sem_evento", "sum"),
         n_conflitantes=("n_conflitantes", "sum"),
     ).reset_index()
+    # Melhor nível de match por pasta (forte > medio > fraco > sem_match)
+    pasta_nivel = (
+        df_pbase.groupby("pasta")["nivel_match"]
+        .apply(lambda s: min(s.tolist(), key=lambda n: _NIVEL_MATCH_RANK.get(n, 99)))
+        .reset_index(name="nivel_match")
+    )
 
     df_final = (pasta_res
-                .merge(pasta_val,  on="pasta", how="left")
-                .merge(pasta_tv,   on="pasta", how="left")
-                .merge(pasta_metr, on="pasta", how="left"))
+                .merge(pasta_val,   on="pasta", how="left")
+                .merge(pasta_tv,    on="pasta", how="left")
+                .merge(pasta_metr,  on="pasta", how="left")
+                .merge(pasta_nivel, on="pasta", how="left"))
     df_final["valor"]     = df_final["valor"].fillna(0.0)
     df_final["tem_valor"] = df_final["tem_valor"].fillna(0).astype(int)
 
@@ -640,7 +672,8 @@ CREATE TABLE IF NOT EXISTS controle_uploads (
     nome_arquivo                    TEXT    NOT NULL,
     quantidade_registros_processados INTEGER NOT NULL,
     nucleo                          TEXT,
-    competencia                     TEXT
+    competencia                     TEXT,
+    tipo_arquivo                    TEXT
 )
 """
 
@@ -699,6 +732,7 @@ def _garantir_schema(cur) -> None:
     _col(cur, "demandas",            "competencia",          "TEXT")
     _col(cur, "controle_uploads",    "nucleo",               "TEXT")
     _col(cur, "controle_uploads",    "competencia",          "TEXT")
+    _col(cur, "controle_uploads",    "tipo_arquivo",         "TEXT")
 
 
 # =============================================================================
@@ -716,6 +750,24 @@ def _preparar_df_pastas(df: pd.DataFrame, nome_nucleo: str | None) -> pd.DataFra
     return df.where(pd.notnull(df), other=None)
 
 
+def _normalizar_competencia(s: str | None) -> str | None:
+    """
+    Converte string de competência para formato canônico YYYY-MM.
+    Aceita: "MM/AAAA", "YYYY-MM", "YYYY-M". Retorna None se vazio/inválido.
+    """
+    if not s:
+        return None
+    s = s.strip()
+    m = re.fullmatch(r"(\d{1,2})/(\d{4})", s)          # MM/AAAA (entrada do usuário)
+    if m:
+        return f"{m.group(2)}-{int(m.group(1)):02d}"
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})", s)           # YYYY-MM / YYYY-M (pandas Period)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    log.warning("Formato de competência não reconhecido: %r — mantido como está.", s)
+    return s
+
+
 def _inferir_competencia(df_dem: pd.DataFrame) -> str | None:
     if "entrada" not in df_dem.columns:
         return None
@@ -725,7 +777,7 @@ def _inferir_competencia(df_dem: pd.DataFrame) -> str | None:
     periodos = ent.dt.to_period("M").dropna()
     if periodos.empty:
         return None
-    return str(periodos.mode().iloc[0])
+    return _normalizar_competencia(str(periodos.mode().iloc[0]))
 
 
 def _preparar_df_demandas(
@@ -820,6 +872,68 @@ def _derivar_campos_demandas(df_dem: pd.DataFrame) -> pd.DataFrame:
 # CAPÍTULO 9 – PERSISTÊNCIA
 # =============================================================================
 
+def _recalcular_e_persistir_resultado(
+    nucleo: str | None,
+    con,
+    cur,
+    ts: str,
+) -> int:
+    """
+    Recarrega o histórico completo de demandas e processos do banco, recalcula
+    resultado_economico e atualiza status_exito em pastas_consolidadas.
+    Retorna o número de pastas calculadas.
+    Pré-condição: con.commit() deve ter sido chamado antes para tornar os dados visíveis.
+    """
+    _p = _db.ph()
+
+    if nucleo:
+        df_dem_hist = _db.read_sql(
+            f"SELECT * FROM demandas WHERE nucleo = {_p}", con, params=(nucleo,)
+        )
+        df_proc_hist = _db.read_sql(
+            f"SELECT pasta, processos_vinculados, valor FROM pastas_consolidadas WHERE nucleo = {_p}",
+            con, params=(nucleo,),
+        )
+    else:
+        df_dem_hist  = _db.read_sql("SELECT * FROM demandas WHERE nucleo IS NULL", con)
+        df_proc_hist = _db.read_sql(
+            "SELECT pasta, processos_vinculados, valor FROM pastas_consolidadas WHERE nucleo IS NULL", con
+        )
+
+    for c in ("entrada", "conclusao"):
+        if c in df_dem_hist.columns:
+            df_dem_hist[c] = pd.to_datetime(df_dem_hist[c], errors="coerce")
+
+    df_resultado = calcular_resultado_economico(df_dem_hist, df_proc_hist)
+
+    if df_resultado.empty:
+        log.info("Nenhum resultado econômico a persistir.")
+        return 0
+
+    df_resultado["nucleo"]       = nucleo
+    df_resultado["data_calculo"] = ts
+
+    if nucleo:
+        cur.execute(f"DELETE FROM resultado_economico WHERE nucleo = {_p}", (nucleo,))
+    else:
+        cur.execute("DELETE FROM resultado_economico WHERE nucleo IS NULL")
+
+    cols_res     = [c for c in _COLUNAS_RESULTADO_ECO if c in df_resultado.columns]
+    placeh_res   = ", ".join([_p] * len(cols_res))
+    cols_res_str = ", ".join(cols_res)
+    sql_ins_res  = f"INSERT OR REPLACE INTO resultado_economico ({cols_res_str}) VALUES ({placeh_res})"
+    registros_res = [tuple(row[c] for c in cols_res) for _, row in df_resultado[cols_res].iterrows()]
+    _db.executemany(cur, sql_ins_res, registros_res)
+    log.info("INSERT resultado_economico | pastas=%d", len(registros_res))
+
+    sql_upd_status = f"UPDATE pastas_consolidadas SET status_exito = {_p} WHERE pasta = {_p}"
+    status_updates = [(row["resultado"], row["pasta"]) for _, row in df_resultado.iterrows()]
+    _db.executemany(cur, sql_upd_status, status_updates)
+    log.info("UPDATE status_exito | pastas=%d", len(status_updates))
+
+    return len(registros_res)
+
+
 def salvar_no_banco(
     df_pasta: pd.DataFrame,
     df_dem: pd.DataFrame,
@@ -850,17 +964,14 @@ def salvar_no_banco(
 
     sql_ins_ctrl = (
         f"INSERT INTO controle_uploads "
-        f"(data_upload, nome_arquivo, quantidade_registros_processados, nucleo, competencia) "
-        f"VALUES ({_p}, {_p}, {_p}, {_p}, {_p})"
+        f"(data_upload, nome_arquivo, quantidade_registros_processados, nucleo, competencia, tipo_arquivo) "
+        f"VALUES ({_p}, {_p}, {_p}, {_p}, {_p}, {_p})"
     )
     sql_update_deriv = (
         f"UPDATE pastas_consolidadas "
         f"SET procurador = {_p}, ult_demanda = {_p}, data_ultima_demanda = {_p}, "
         f"    total_horas = {_p}, data_ultima_atualizacao = {_p} "
         f"WHERE pasta = {_p}"
-    )
-    sql_update_status = (
-        f"UPDATE pastas_consolidadas SET status_exito = {_p} WHERE pasta = {_p}"
     )
 
     con = _db.connect()
@@ -912,56 +1023,13 @@ def salvar_no_banco(
         _db.executemany(cur, sql_update_deriv, update_records)
         log.info("UPDATE derivado | pastas=%d", len(update_records))
 
-        # Recomputa resultado_economico para o nucleo usando TODAS as demandas históricas
-        con.commit()  # commit parcial para read_sql enxergar as demandas recém inseridas
-
-        if nucleo:
-            df_dem_hist = _db.read_sql(
-                f"SELECT * FROM demandas WHERE nucleo = {_p}", con, params=(nucleo,)
-            )
-        else:
-            df_dem_hist = _db.read_sql(
-                "SELECT * FROM demandas WHERE nucleo IS NULL", con
-            )
-
-        for c in ("entrada", "conclusao"):
-            if c in df_dem_hist.columns:
-                df_dem_hist[c] = pd.to_datetime(df_dem_hist[c], errors="coerce")
-
-        df_resultado = calcular_resultado_economico(df_dem_hist, df_pasta)
-
-        if not df_resultado.empty:
-            df_resultado["nucleo"]       = nucleo
-            df_resultado["data_calculo"] = ts
-
-            if nucleo:
-                cur.execute(
-                    f"DELETE FROM resultado_economico WHERE nucleo = {_p}", (nucleo,)
-                )
-            else:
-                cur.execute("DELETE FROM resultado_economico WHERE nucleo IS NULL")
-
-            cols_res     = [c for c in _COLUNAS_RESULTADO_ECO if c in df_resultado.columns]
-            placeh_res   = ", ".join([_p] * len(cols_res))
-            cols_res_str = ", ".join(cols_res)
-            sql_ins_res  = (
-                f"INSERT OR REPLACE INTO resultado_economico ({cols_res_str}) VALUES ({placeh_res})"
-            )
-            registros_res = [
-                tuple(row[c] for c in cols_res)
-                for _, row in df_resultado[cols_res].iterrows()
-            ]
-            _db.executemany(cur, sql_ins_res, registros_res)
-            log.info("INSERT resultado_economico | pastas=%d", len(registros_res))
-
-            # Propaga resultado como status_exito em pastas_consolidadas
-            status_updates = [(row["resultado"], row["pasta"]) for _, row in df_resultado.iterrows()]
-            _db.executemany(cur, sql_update_status, status_updates)
-            log.info("UPDATE status_exito | pastas=%d", len(status_updates))
+        # Recomputa resultado_economico usando histórico completo do banco
+        con.commit()  # torna dados recém inseridos visíveis para o recálculo
+        _recalcular_e_persistir_resultado(nucleo, con, cur, ts)
 
         # Controle de uploads
-        cur.execute(sql_ins_ctrl, (ts, str(nome_arquivo_proc), len(registros_pasta), nucleo, competencia))
-        cur.execute(sql_ins_ctrl, (ts, str(nome_arquivo_dem),  len(registros_dem),   nucleo, competencia))
+        cur.execute(sql_ins_ctrl, (ts, str(nome_arquivo_proc), len(registros_pasta), nucleo, competencia, "completo"))
+        cur.execute(sql_ins_ctrl, (ts, str(nome_arquivo_dem),  len(registros_dem),   nucleo, competencia, "completo"))
         con.commit()
         log.info("Transação concluída com sucesso.")
     except Exception:
@@ -1011,7 +1079,7 @@ def processar_demandas(
     df["processo_base"] = df["processo_orig"].apply(normalizar_processo_base)
     df = _converter_demandas_tipos(df)
 
-    comp = competencia or _inferir_competencia(df)
+    comp = _normalizar_competencia(competencia) or _inferir_competencia(df)
     df["competencia"] = comp
 
     log.info("Pipeline demandas concluída | linhas=%d | competencia=%s", len(df), comp)
@@ -1057,7 +1125,7 @@ def ingerir_upload_bytes(
     df_dem["processo_base"] = df_dem["processo_orig"].apply(normalizar_processo_base)
     df_dem = _converter_demandas_tipos(df_dem)
 
-    comp = competencia or _inferir_competencia(df_dem)
+    comp = _normalizar_competencia(competencia) or _inferir_competencia(df_dem)
     df_deriv   = _derivar_campos_demandas(df_dem)
     df_dem_db  = _preparar_df_demandas(df_dem, nome_nucleo, comp)
 
@@ -1070,6 +1138,166 @@ def ingerir_upload_bytes(
     return len(df_pasta_db), len(df_dem_db)
 
 
+def ingerir_somente_processos(
+    bytes_processos: bytes,
+    nome_arquivo: str,
+    nome_nucleo: str,
+    competencia: str | None = None,
+) -> int:
+    """
+    Ingere apenas o Relatório de Processos: UPSERT no catálogo de pastas e
+    recalcula resultado_economico cruzando com TODAS as demandas históricas do banco.
+    Não apaga demandas. Retorna a quantidade de pastas processadas.
+    """
+    log.info("=== PIPELINE SOMENTE PROCESSOS | arquivo=%s ===", nome_arquivo)
+
+    df = _ler_csv_bytes(bytes_processos, nome=nome_arquivo)
+    df = _descartar_colunas_espurias(df)
+    df = _normalizar_nomes(df, MAPA_COLUNAS)
+    df = _converter_datas_processos(df)
+    df = _converter_valor_financeiro(df)
+    df = _extrair_oab(df)
+    df = _agregar_por_pasta(df)
+    df["status_exito"] = "Em andamento"
+    df_pasta_db = _preparar_df_pastas(df, nome_nucleo)
+
+    comp = _normalizar_competencia(competencia)  # opcional; apenas para registro
+    ts   = datetime.now().isoformat(timespec="seconds")
+    _p   = _db.ph()
+
+    con = _db.connect()
+    try:
+        cur = con.cursor()
+        _garantir_schema(cur)
+
+        df_pasta_db = _merge_processos_vinculados(df_pasta_db, con)
+
+        cols_pasta   = [c for c in _COLUNAS_SCHEMA_PASTA if c in df_pasta_db.columns]
+        cols_str     = ", ".join(cols_pasta)
+        placeh_str   = ", ".join([_p] * len(cols_pasta))
+        atualizacoes = ", ".join(f"{c} = excluded.{c}" for c in _COLUNAS_ATUALIZAVEIS if c in cols_pasta)
+        sql_upsert   = (
+            f"INSERT INTO pastas_consolidadas ({cols_str}) "
+            f"VALUES ({placeh_str}) "
+            f"ON CONFLICT(pasta) DO UPDATE SET {atualizacoes}"
+        )
+        registros_pasta = [tuple(r) for r in df_pasta_db[cols_pasta].itertuples(index=False, name=None)]
+        _db.executemany(cur, sql_upsert, registros_pasta)
+        log.info("UPSERT pastas (somente processos) | registros=%d", len(registros_pasta))
+
+        cur.execute(
+            f"INSERT INTO controle_uploads "
+            f"(data_upload, nome_arquivo, quantidade_registros_processados, nucleo, competencia, tipo_arquivo) "
+            f"VALUES ({_p}, {_p}, {_p}, {_p}, {_p}, {_p})",
+            (ts, nome_arquivo, len(registros_pasta), nome_nucleo, comp, "processos"),
+        )
+
+        con.commit()
+        _recalcular_e_persistir_resultado(nome_nucleo, con, cur, ts)
+        con.commit()
+        log.info("Transação somente processos concluída.")
+    except Exception:
+        con.rollback()
+        log.exception("Erro ao salvar processos. Transação revertida.")
+        raise
+    finally:
+        con.close()
+
+    return len(registros_pasta)
+
+
+def ingerir_somente_demandas(
+    bytes_demandas: bytes,
+    nome_arquivo: str,
+    nome_nucleo: str,
+    competencia: str | None = None,
+) -> int:
+    """
+    Ingere apenas o Relatório de Demandas: DELETE idempotente por (competencia, nucleo),
+    INSERT, atualiza campos derivados e recalcula resultado_economico com catálogo histórico.
+    Retorna a quantidade de demandas processadas.
+    """
+    log.info("=== PIPELINE SOMENTE DEMANDAS | arquivo=%s ===", nome_arquivo)
+
+    df_dem = _ler_csv_bytes(bytes_demandas, nome=nome_arquivo)
+    df_dem = _descartar_colunas_espurias(df_dem)
+    df_dem = _normalizar_nomes(df_dem, MAPA_COLUNAS_DEMANDAS)
+
+    if "processo_orig" not in df_dem.columns:
+        raise KeyError("Coluna 'Processo' não encontrada no arquivo de demandas.")
+    if "pasta" not in df_dem.columns:
+        raise KeyError("Coluna 'Pasta' não encontrada no arquivo de demandas.")
+
+    df_dem["processo_orig"] = df_dem["processo_orig"].str.strip()
+    df_dem["pasta"]         = df_dem["pasta"].str.strip()
+    df_dem["processo_base"] = df_dem["processo_orig"].apply(normalizar_processo_base)
+    df_dem = _converter_demandas_tipos(df_dem)
+
+    comp      = _normalizar_competencia(competencia) or _inferir_competencia(df_dem)
+    df_deriv  = _derivar_campos_demandas(df_dem)
+    df_dem_db = _preparar_df_demandas(df_dem, nome_nucleo, comp)
+
+    ts = datetime.now().isoformat(timespec="seconds")
+    _p = _db.ph()
+
+    if nome_nucleo is None:
+        sql_del_dem = f"DELETE FROM demandas WHERE competencia = {_p} AND nucleo IS NULL"
+        del_params  = (comp,)
+    else:
+        sql_del_dem = f"DELETE FROM demandas WHERE competencia = {_p} AND nucleo = {_p}"
+        del_params  = (comp, nome_nucleo)
+
+    sql_update_deriv = (
+        f"UPDATE pastas_consolidadas "
+        f"SET procurador = {_p}, ult_demanda = {_p}, data_ultima_demanda = {_p}, "
+        f"    total_horas = {_p}, data_ultima_atualizacao = {_p} "
+        f"WHERE pasta = {_p}"
+    )
+
+    con = _db.connect()
+    try:
+        cur = con.cursor()
+        _garantir_schema(cur)
+
+        cur.execute(sql_del_dem, del_params)
+
+        cols_dem      = [c for c in _COLUNAS_SCHEMA_DEM if c in df_dem_db.columns]
+        placeh_dem    = ", ".join([_p] * len(cols_dem))
+        cols_dem_str  = ", ".join(cols_dem)
+        sql_ins_dem   = f"INSERT INTO demandas ({cols_dem_str}) VALUES ({placeh_dem})"
+        registros_dem = [tuple(r) for r in df_dem_db[cols_dem].itertuples(index=False, name=None)]
+        _db.executemany(cur, sql_ins_dem, registros_dem)
+        log.info("INSERT demandas (somente demandas) | registros=%d", len(registros_dem))
+
+        update_records = [
+            (row["procurador"], row["ult_demanda"], row["data_ultima_demanda"],
+             row.get("total_horas"), ts, row["pasta"])
+            for _, row in df_deriv.iterrows()
+        ]
+        _db.executemany(cur, sql_update_deriv, update_records)
+        log.info("UPDATE derivado | pastas=%d", len(update_records))
+
+        cur.execute(
+            f"INSERT INTO controle_uploads "
+            f"(data_upload, nome_arquivo, quantidade_registros_processados, nucleo, competencia, tipo_arquivo) "
+            f"VALUES ({_p}, {_p}, {_p}, {_p}, {_p}, {_p})",
+            (ts, nome_arquivo, len(registros_dem), nome_nucleo, comp, "demandas"),
+        )
+
+        con.commit()
+        _recalcular_e_persistir_resultado(nome_nucleo, con, cur, ts)
+        con.commit()
+        log.info("Transação somente demandas concluída.")
+    except Exception:
+        con.rollback()
+        log.exception("Erro ao salvar demandas. Transação revertida.")
+        raise
+    finally:
+        con.close()
+
+    return len(registros_dem)
+
+
 def processar_base_jurimetria(
     caminho_processos: str | Path,
     caminho_demandas: str | Path,
@@ -1080,7 +1308,7 @@ def processar_base_jurimetria(
     df_pasta = processar_processos(caminho_processos)
     df_dem   = processar_demandas(caminho_demandas, competencia=competencia)
 
-    comp = competencia or _inferir_competencia(df_dem)
+    comp = _normalizar_competencia(competencia) or _inferir_competencia(df_dem)
     df_deriv    = _derivar_campos_demandas(df_dem)
     df_pasta_db = _preparar_df_pastas(df_pasta, nome_nucleo)
     df_dem_db   = _preparar_df_demandas(df_dem, nome_nucleo, comp)
@@ -1088,7 +1316,6 @@ def processar_base_jurimetria(
     salvar_no_banco(
         df_pasta_db, df_dem_db, df_deriv,
         caminho_processos, caminho_demandas,
-        nome_banco=nome_banco,
         nucleo=nome_nucleo,
         competencia=comp,
     )
